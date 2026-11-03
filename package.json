@@ -1,0 +1,13 @@
+{
+  "name": "nasawa-technical-college-e-library",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Nasawa Technical College online library",
+  "scripts": {
+    "start": "node server.js",
+    "build": "node -e \"const fs = require('node:fs'); const vm = require('node:vm'); for (const file of ['server.js', 'SCRIPT.JS', 'BOOK-CATALOG.JS']) new vm.Script(fs.readFileSync(file, 'utf8'), { filename: file });\""
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
