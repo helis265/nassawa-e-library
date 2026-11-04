@@ -52,6 +52,12 @@ const DEFAULT_DEVELOPERS = [
     accent: "gold"
   }
 ];
+const DEFAULT_DEPARTMENTS = [
+  "Accounting", "Administrative Studies", "Automobile Mechanics", "Brick Laying",
+  "Carpentry and Joinery", "Community Development", "Fabrication and Welding",
+  "General Fitting", "Human Resource Management", "Information and Communication Technology",
+  "Motorcycle Mechanics", "Procurement", "Public Health"
+];
 
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
@@ -79,12 +85,14 @@ function readStore() {
       users: Array.isArray(store.users) ? store.users : [],
       books: Array.isArray(store.books) ? store.books : [],
       videos: Array.isArray(store.videos) ? store.videos : [],
+      departments: Array.isArray(store.departments) ? store.departments : [],
+      hierarchyInitialized: store.hierarchyInitialized === true,
       excludedBookSources: Array.isArray(store.excludedBookSources) ? store.excludedBookSources : [],
       activity: Array.isArray(store.activity) ? store.activity : [],
       developers: Array.isArray(store.developers) && store.developers.length ? store.developers : DEFAULT_DEVELOPERS
     };
   } catch (error) {
-    if (error.code === "ENOENT") return { users: [], books: [], videos: [], excludedBookSources: [], activity: [], developers: DEFAULT_DEVELOPERS };
+    if (error.code === "ENOENT") return { users: [], books: [], videos: [], departments: [], hierarchyInitialized: false, excludedBookSources: [], activity: [], developers: DEFAULT_DEVELOPERS };
     throw new Error(`Could not read library data: ${error.message}`);
   }
 }
@@ -92,11 +100,135 @@ function readStore() {
 let store = readStore();
 store.developers = (Array.isArray(store.developers) ? store.developers : []).map(normalizeDeveloper);
 if (!store.developers.length) store.developers = DEFAULT_DEVELOPERS.map((developer, index) => normalizeDeveloper(developer, index));
+store.departments = store.departments.map((department) => ({
+  id: cleanText(department?.id, 80) || crypto.randomUUID(),
+  name: cleanText(department?.name, 100),
+  levels: (Array.isArray(department?.levels) ? department.levels : []).map((level) => ({
+    id: cleanText(level?.id, 80) || crypto.randomUUID(),
+    name: cleanText(level?.name, 80),
+    subjects: (Array.isArray(level?.subjects) ? level.subjects : []).map((subject) => ({
+      id: cleanText(subject?.id, 80) || crypto.randomUUID(),
+      name: cleanText(subject?.name, 100)
+    })).filter((subject) => subject.name)
+  })).filter((level) => level.name)
+})).filter((department) => department.name);
 
 function saveStore() {
   const temporaryFile = `${STORE_FILE}.tmp`;
   fs.writeFileSync(temporaryFile, JSON.stringify(store, null, 2), { mode: 0o600 });
   fs.renameSync(temporaryFile, STORE_FILE);
+}
+
+function ensureDepartment(name) {
+  const cleanName = cleanText(name, 100) || "General";
+  let department = store.departments.find((item) => item.name.toLowerCase() === cleanName.toLowerCase());
+  if (!department) {
+    department = { id: crypto.randomUUID(), name: cleanName, levels: [] };
+    store.departments.push(department);
+  }
+  return department;
+}
+
+function ensureLevel(department, name) {
+  const cleanName = cleanText(name, 80) || "General";
+  let level = department.levels.find((item) => item.name.toLowerCase() === cleanName.toLowerCase());
+  if (!level) {
+    level = { id: crypto.randomUUID(), name: cleanName, subjects: [] };
+    department.levels.push(level);
+  }
+  return level;
+}
+
+function ensureSubject(level, name) {
+  const cleanName = cleanText(name, 100) || "General";
+  let subject = level.subjects.find((item) => item.name.toLowerCase() === cleanName.toLowerCase());
+  if (!subject) {
+    subject = { id: crypto.randomUUID(), name: cleanName };
+    level.subjects.push(subject);
+  }
+  return subject;
+}
+
+function assignResourceLocation(resource) {
+  const parts = (resource.sourcePath || "").split(/[\\/]/).filter(Boolean);
+  const levelName = resource.level || parts.find((part) => /^level\\s*\\d+$/i.test(part)) || "General";
+  const levelIndex = parts.findIndex((part) => /^level\\s*\\d+$/i.test(part));
+  const subjectName = resource.subject || (levelIndex >= 0 && parts[levelIndex + 1] && levelIndex + 1 < parts.length - 1
+    ? parts[levelIndex + 1] : "General");
+  const department = ensureDepartment(resource.category);
+  const level = ensureLevel(department, levelName);
+  const subject = ensureSubject(level, subjectName);
+  resource.category = department.name;
+  resource.level = level.name;
+  resource.subject = subject.name;
+  resource.departmentId = department.id;
+  resource.levelId = level.id;
+  resource.subjectId = subject.id;
+}
+
+function initializeHierarchy() {
+  if (!store.hierarchyInitialized) {
+    DEFAULT_DEPARTMENTS.forEach((name) => {
+      const department = ensureDepartment(name);
+      [1, 2, 3, 4].forEach((number) => ensureLevel(department, `Level ${number}`));
+    });
+    store.hierarchyInitialized = true;
+  }
+  store.books.forEach(assignResourceLocation);
+  store.videos.forEach(assignResourceLocation);
+}
+
+initializeHierarchy();
+
+function findLevel(levelId) {
+  for (const department of store.departments) {
+    const level = department.levels.find((item) => item.id === levelId);
+    if (level) return { department, level };
+  }
+  return null;
+}
+
+function findSubject(subjectId) {
+  for (const department of store.departments) {
+    for (const level of department.levels) {
+      const subject = level.subjects.find((item) => item.id === subjectId);
+      if (subject) return { department, level, subject };
+    }
+  }
+  return null;
+}
+
+function resourceLocation(body) {
+  const department = store.departments.find((item) => item.id === body.departmentId);
+  const level = department?.levels.find((item) => item.id === body.levelId);
+  const subject = level?.subjects.find((item) => item.id === body.subjectId);
+  if (!department || !level || !subject) {
+    throw Object.assign(new Error("Choose a valid department, level, and subject."), { status: 400 });
+  }
+  return {
+    category: department.name, level: level.name, subject: subject.name,
+    departmentId: department.id, levelId: level.id, subjectId: subject.id
+  };
+}
+
+function deleteResources(predicate) {
+  const removedBooks = store.books.filter(predicate);
+  const removedVideos = store.videos.filter(predicate);
+  for (const book of removedBooks) {
+    if (book.sourcePath && !store.excludedBookSources.includes(book.sourcePath)) store.excludedBookSources.push(book.sourcePath);
+  }
+  const removedIds = new Set([...removedBooks, ...removedVideos].map((resource) => resource.id));
+  store.books = store.books.filter((book) => !removedIds.has(book.id));
+  store.videos = store.videos.filter((video) => !removedIds.has(video.id));
+  store.activity = store.activity.filter((item) => !removedIds.has(item.bookId));
+  for (const resource of [...removedBooks, ...removedVideos]) {
+    if (!resource.storedName) continue;
+    try {
+      fs.unlinkSync(path.join(UPLOAD_DIR, resource.storedName));
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+  }
 }
 
 function sendJson(response, status, value, headers = {}) {
@@ -212,6 +344,8 @@ function recordActivity(userId, bookId, action) {
 function publicBook(book, userId) {
   return {
     id: book.id, title: book.title, author: book.author, category: book.category,
+    level: book.level || "General", subject: book.subject || "General",
+    departmentId: book.departmentId, levelId: book.levelId, subjectId: book.subjectId,
     description: book.description, fileName: book.fileName, extension: book.extension,
     size: book.size, uploadedAt: book.uploadedAt, downloads: book.downloads || 0,
     reads: book.reads || 0, favorite: (book.favorites || []).includes(userId),
@@ -222,6 +356,8 @@ function publicBook(book, userId) {
 function publicVideo(video) {
   return {
     id: video.id, title: video.title, category: video.category, description: video.description,
+    level: video.level || "General", subject: video.subject || "General",
+    departmentId: video.departmentId, levelId: video.levelId, subjectId: video.subjectId,
     fileName: video.fileName, extension: video.extension, size: video.size, uploadedAt: video.uploadedAt
   };
 }
@@ -370,6 +506,124 @@ async function handleApi(request, response, url) {
 
   if (pathname === "/api/me" && method === "GET") {
     return sendJson(response, 200, { user: safeUser(user) });
+  }
+
+  if (pathname === "/api/departments" && method === "GET") {
+    return sendJson(response, 200, { departments: store.departments });
+  }
+
+  if (pathname === "/api/admin/departments" && method === "GET") {
+    if (!requireAdmin(request, response)) return;
+    return sendJson(response, 200, { departments: store.departments });
+  }
+
+  if (pathname === "/api/admin/departments" && method === "POST") {
+    if (!requireAdmin(request, response)) return;
+    const body = await readJson(request);
+    const name = cleanText(body.name, 100);
+    if (!name) return sendError(response, 400, "A department name is required.");
+    if (store.departments.some((department) => department.name.toLowerCase() === name.toLowerCase())) {
+      return sendError(response, 409, "That department already exists.");
+    }
+    const department = { id: crypto.randomUUID(), name, levels: [] };
+    store.departments.push(department);
+    saveStore();
+    return sendJson(response, 201, { department });
+  }
+
+  const departmentMatch = pathname.match(/^\/api\/admin\/departments\/([a-f0-9-]+)$/i);
+  if (departmentMatch && (method === "PATCH" || method === "DELETE")) {
+    if (!requireAdmin(request, response)) return;
+    const department = store.departments.find((item) => item.id === departmentMatch[1]);
+    if (!department) return sendError(response, 404, "This department could not be found.");
+    if (method === "PATCH") {
+      const body = await readJson(request);
+      const name = cleanText(body.name, 100);
+      if (!name) return sendError(response, 400, "A department name is required.");
+      if (store.departments.some((item) => item.id !== department.id && item.name.toLowerCase() === name.toLowerCase())) {
+        return sendError(response, 409, "That department already exists.");
+      }
+      department.name = name;
+      [...store.books, ...store.videos].filter((resource) => resource.departmentId === department.id).forEach((resource) => { resource.category = name; });
+      saveStore();
+      return sendJson(response, 200, { department });
+    }
+    deleteResources((resource) => resource.departmentId === department.id);
+    store.departments = store.departments.filter((item) => item.id !== department.id);
+    saveStore();
+    return sendJson(response, 200, { ok: true });
+  }
+
+  const departmentLevelsMatch = pathname.match(/^\/api\/admin\/departments\/([a-f0-9-]+)\/levels$/i);
+  if (departmentLevelsMatch && method === "POST") {
+    if (!requireAdmin(request, response)) return;
+    const department = store.departments.find((item) => item.id === departmentLevelsMatch[1]);
+    if (!department) return sendError(response, 404, "This department could not be found.");
+    const body = await readJson(request);
+    const name = cleanText(body.name, 80);
+    if (!name) return sendError(response, 400, "A level name is required.");
+    if (department.levels.some((item) => item.name.toLowerCase() === name.toLowerCase())) return sendError(response, 409, "That level already exists in this department.");
+    const level = { id: crypto.randomUUID(), name, subjects: [] };
+    department.levels.push(level);
+    saveStore();
+    return sendJson(response, 201, { level });
+  }
+
+  const levelMatch = pathname.match(/^\/api\/admin\/levels\/([a-f0-9-]+)$/i);
+  if (levelMatch && (method === "PATCH" || method === "DELETE")) {
+    if (!requireAdmin(request, response)) return;
+    const found = findLevel(levelMatch[1]);
+    if (!found) return sendError(response, 404, "This level could not be found.");
+    if (method === "PATCH") {
+      const body = await readJson(request);
+      const name = cleanText(body.name, 80);
+      if (!name) return sendError(response, 400, "A level name is required.");
+      if (found.department.levels.some((item) => item.id !== found.level.id && item.name.toLowerCase() === name.toLowerCase())) return sendError(response, 409, "That level already exists in this department.");
+      found.level.name = name;
+      [...store.books, ...store.videos].filter((resource) => resource.levelId === found.level.id).forEach((resource) => { resource.level = name; });
+      saveStore();
+      return sendJson(response, 200, { level: found.level });
+    }
+    deleteResources((resource) => resource.levelId === found.level.id);
+    found.department.levels = found.department.levels.filter((item) => item.id !== found.level.id);
+    saveStore();
+    return sendJson(response, 200, { ok: true });
+  }
+
+  const levelSubjectsMatch = pathname.match(/^\/api\/admin\/levels\/([a-f0-9-]+)\/subjects$/i);
+  if (levelSubjectsMatch && method === "POST") {
+    if (!requireAdmin(request, response)) return;
+    const found = findLevel(levelSubjectsMatch[1]);
+    if (!found) return sendError(response, 404, "This level could not be found.");
+    const body = await readJson(request);
+    const name = cleanText(body.name, 100);
+    if (!name) return sendError(response, 400, "A subject name is required.");
+    if (found.level.subjects.some((item) => item.name.toLowerCase() === name.toLowerCase())) return sendError(response, 409, "That subject already exists in this level.");
+    const subject = { id: crypto.randomUUID(), name };
+    found.level.subjects.push(subject);
+    saveStore();
+    return sendJson(response, 201, { subject });
+  }
+
+  const subjectMatch = pathname.match(/^\/api\/admin\/subjects\/([a-f0-9-]+)$/i);
+  if (subjectMatch && (method === "PATCH" || method === "DELETE")) {
+    if (!requireAdmin(request, response)) return;
+    const found = findSubject(subjectMatch[1]);
+    if (!found) return sendError(response, 404, "This subject could not be found.");
+    if (method === "PATCH") {
+      const body = await readJson(request);
+      const name = cleanText(body.name, 100);
+      if (!name) return sendError(response, 400, "A subject name is required.");
+      if (found.level.subjects.some((item) => item.id !== found.subject.id && item.name.toLowerCase() === name.toLowerCase())) return sendError(response, 409, "That subject already exists in this level.");
+      found.subject.name = name;
+      [...store.books, ...store.videos].filter((resource) => resource.subjectId === found.subject.id).forEach((resource) => { resource.subject = name; });
+      saveStore();
+      return sendJson(response, 200, { subject: found.subject });
+    }
+    deleteResources((resource) => resource.subjectId === found.subject.id);
+    found.level.subjects = found.level.subjects.filter((item) => item.id !== found.subject.id);
+    saveStore();
+    return sendJson(response, 200, { ok: true });
   }
 
   if (pathname === "/api/books" && method === "GET") {
@@ -583,12 +837,12 @@ async function handleApi(request, response, url) {
     if (!VIDEO_EXTENSIONS.has(extension)) return sendError(response, 415, "Videos must be MP4, WebM, MOV, or M4V.");
     if (upload.data.length > MAX_VIDEO_UPLOAD_BYTES) return sendError(response, 413, "Videos must be 300 MB or smaller.");
     const title = cleanText(values.title, 140) || path.basename(fileName, extension).replace(/[_-]+/g, " ");
-    const category = cleanText(values.category, 80);
-    if (!title || !category) return sendError(response, 400, "A video title and department are required.");
+    if (!title) return sendError(response, 400, "A video title is required.");
+    const location = resourceLocation(values);
     const storedName = `${crypto.randomUUID()}${extension}`;
     fs.writeFileSync(path.join(UPLOAD_DIR, storedName), upload.data, { flag: "wx", mode: 0o600 });
     const video = {
-      id: crypto.randomUUID(), title, category, description: cleanText(values.description, 1200),
+      id: crypto.randomUUID(), title, ...location, description: cleanText(values.description, 1200),
       fileName, extension, storedName, size: upload.data.length, uploadedAt: new Date().toISOString()
     };
     store.videos.push(video);
@@ -599,6 +853,21 @@ async function handleApi(request, response, url) {
   if (pathname === "/api/admin/videos" && method === "GET") {
     if (!requireAdmin(request, response)) return;
     return sendJson(response, 200, { videos: store.videos.map(publicVideo) });
+  }
+
+  const adminVideoEditMatch = pathname.match(/^\/api\/admin\/videos\/([a-f0-9-]+)$/i);
+  if (adminVideoEditMatch && method === "PATCH") {
+    if (!requireAdmin(request, response)) return;
+    const video = store.videos.find((item) => item.id === adminVideoEditMatch[1]);
+    if (!video) return sendError(response, 404, "This video could not be found.");
+    const body = await readJson(request);
+    const title = cleanText(body.title, 140);
+    if (!title) return sendError(response, 400, "A video title is required.");
+    video.title = title;
+    video.description = cleanText(body.description, 1200);
+    if (body.departmentId || body.levelId || body.subjectId) Object.assign(video, resourceLocation(body));
+    saveStore();
+    return sendJson(response, 200, { video: publicVideo(video) });
   }
 
   const adminVideoMatch = pathname.match(/^\/api\/admin\/videos\/([a-f0-9-]+)$/i);
@@ -631,13 +900,13 @@ async function handleApi(request, response, url) {
     if (!ALLOWED_EXTENSIONS.has(extension)) return sendError(response, 415, "This file type is not supported.");
     if (upload.data.length > MAX_UPLOAD_BYTES) return sendError(response, 413, "Files must be 50 MB or smaller.");
     const title = cleanText(values.title, 140) || path.basename(fileName, extension).replace(/[_-]+/g, " ");
-    const category = cleanText(values.category, 80) || "General";
     if (!title) return sendError(response, 400, "A book title is required.");
+    const location = resourceLocation(values);
     const storedName = `${crypto.randomUUID()}${extension}`;
     fs.writeFileSync(path.join(UPLOAD_DIR, storedName), upload.data, { flag: "wx", mode: 0o600 });
     const book = {
       id: crypto.randomUUID(), title, author: cleanText(values.author, 100) || "Nasawa Technical College",
-      category, description: cleanText(values.description, 1200), fileName, extension,
+      ...location, description: cleanText(values.description, 1200), fileName, extension,
       storedName, size: upload.data.length, uploadedAt: new Date().toISOString(),
       downloads: 0, reads: 0, favorites: []
     };
@@ -649,6 +918,22 @@ async function handleApi(request, response, url) {
   if (pathname === "/api/admin/books" && method === "GET") {
     if (!requireAdmin(request, response)) return;
     return sendJson(response, 200, { books: store.books.map((book) => publicBook(book, user.id)) });
+  }
+
+  const adminBookEditMatch = pathname.match(/^\/api\/admin\/books\/([a-f0-9-]+)$/i);
+  if (adminBookEditMatch && method === "PATCH") {
+    if (!requireAdmin(request, response)) return;
+    const book = store.books.find((item) => item.id === adminBookEditMatch[1]);
+    if (!book) return sendError(response, 404, "This book could not be found.");
+    const body = await readJson(request);
+    const title = cleanText(body.title, 140);
+    if (!title) return sendError(response, 400, "A book title is required.");
+    book.title = title;
+    book.author = cleanText(body.author, 100) || book.author;
+    book.description = cleanText(body.description, 1200);
+    if (body.departmentId || body.levelId || body.subjectId) Object.assign(book, resourceLocation(body));
+    saveStore();
+    return sendJson(response, 200, { book: publicBook(book, user.id) });
   }
 
   const adminBookMatch = pathname.match(/^\/api\/admin\/books\/([a-f0-9-]+)$/i);
@@ -754,6 +1039,7 @@ async function start() {
     throw new Error(`The configured administrator email ${ADMIN_EMAIL} is already registered as a student.`);
   }
   importBooksFromFolder();
+  initializeHierarchy();
   saveStore();
 
   const server = http.createServer(async (request, response) => {

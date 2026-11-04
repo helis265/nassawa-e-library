@@ -1,26 +1,16 @@
 "use strict";
 
 // Keep the interface state in memory; user accounts, books, and activity live on the server.
-const DEPARTMENTS = [
-  "Accounting", "Administrative Studies", "Automobile Mechanics", "Brick Laying",
-  "Carpentry and Joinery", "Community Development", "Fabrication and Welding",
-  "General Fitting", "Human Resource Management", "Information and Communication Technology",
-  "Motorcycle Mechanics", "Procurement", "Public Health"
-];
 const COVER_TONES = ["sage", "sand", "blue", "rose", "gold", "lavender"];
-const OFFLINE_ACCOUNTS_KEY = "nasawa-offline-accounts";
-const OFFLINE_SESSION_KEY = "nasawa-offline-session";
-const OFFLINE_FAVORITES_KEY = "nasawa-offline-favorites";
-const OFFLINE_ACTIVITY_KEY = "nasawa-offline-activity";
-const OFFLINE_ABOUT_KEY = "nasawa-offline-about";
 const state = {
   user: null,
   books: [],
   videos: [],
+  departments: [],
   developers: [],
-  offlineMode: window.location.protocol === "file:",
   view: "home",
   category: "All departments",
+  departmentId: "",
   selectedLevel: "",
   selectedSubject: "",
   videoCategory: "All departments",
@@ -65,137 +55,7 @@ function notify(message, isError = false) {
   window.setTimeout(() => toast.remove(), 3800);
 }
 
-function readLocalJSON(key, fallback) {
-  const value = localStorage.getItem(key);
-  return value ? JSON.parse(value) : fallback;
-}
-
-function offlineBookCatalog() {
-  const paths = window.NASAWA_BOOK_CATALOG || [];
-  const favorites = readLocalJSON(OFFLINE_FAVORITES_KEY, {});
-  const departments = new Map([
-    ["INFORMATION AND COMMUNICATION TECHNOLOGY", "Information and Communication Technology"],
-    ["FABLICATION AND WELDING", "Fabrication and Welding"]
-  ]);
-  return paths.map((relativePath, index) => {
-    const segments = relativePath.split("/");
-    const fileName = segments[segments.length - 1];
-    const extension = fileName.slice(fileName.lastIndexOf(".")).toLowerCase();
-    const departmentFolder = segments[0].toUpperCase();
-    const department = departments.get(departmentFolder) || departmentFolder.toLowerCase()
-      .replace(/\b\w/g, (letter) => letter.toUpperCase());
-    const levelFolder = segments.find((part) => /^level\s*\d+$/i.test(part)) || "";
-    const levelIndex = levelFolder ? segments.indexOf(levelFolder) : -1;
-    const subject = levelIndex >= 0 && segments[levelIndex + 1] && levelIndex + 1 < segments.length - 1
-      ? segments[levelIndex + 1] : "";
-    const id = `offline-${index + 1}`;
-    return {
-      id, title: fileName.slice(0, -extension.length).replace(/[_-]+/g, " ").replace(/\s+/g, " ").trim(),
-      author: "Nasawa Technical College", category: department, description: "",
-      fileName, extension, size: 0, uploadedAt: new Date(index).toISOString(),
-      favorite: (favorites[state.user?.id] || []).includes(id),
-      relativePath, level: levelFolder, subject,
-      fileUrl: `./BOOKS/${segments.map(encodeURIComponent).join("/")}`
-    };
-  });
-}
-
-function titleCaseFolder(value = "") {
-  return value.trim().split(/[\s_-]+/).filter(Boolean).map((word) => (
-    word.length <= 3 ? word.toUpperCase() : word[0].toUpperCase() + word.slice(1).toLowerCase()
-  )).join(" ");
-}
-
-function bookHierarchy(book) {
-  const parts = (book.relativePath || "").split(/[\\/]/).filter(Boolean);
-  const level = book.level || parts.find((part) => /^level\s*\d+$/i.test(part)) || "Other resources";
-  const levelIndex = parts.findIndex((part) => /^level\s*\d+$/i.test(part));
-  const subject = book.subject || (levelIndex >= 0 && parts[levelIndex + 1] !== parts[parts.length - 1] ? parts[levelIndex + 1] : "General");
-  return { level: titleCaseFolder(level), subject: titleCaseFolder(subject) };
-}
-
-function offlinePasswordHash(password, salt) {
-  if (!window.crypto?.subtle) throw new Error("Secure browser sign-in needs HTTPS. Serve this static site over HTTPS or on localhost.");
-  const bytes = new Uint8Array(salt.match(/.{2}/g).map((part) => Number.parseInt(part, 16)));
-  return window.crypto.subtle.importKey("raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveBits"])
-    .then((key) => window.crypto.subtle.deriveBits({ name: "PBKDF2", salt: bytes, iterations: 120000, hash: "SHA-256" }, key, 256))
-    .then((derived) => [...new Uint8Array(derived)].map((value) => value.toString(16).padStart(2, "0")).join(""));
-}
-
-async function offlineApi(url, options = {}) {
-  const method = options.method || "GET";
-  const payload = typeof options.body === "string" ? JSON.parse(options.body) : {};
-  const accounts = readLocalJSON(OFFLINE_ACCOUNTS_KEY, []);
-  const session = readLocalJSON(OFFLINE_SESSION_KEY, null);
-  const route = url.split("?")[0];
-  const fail = (message, status = 400) => {
-    const error = new Error(message);
-    error.status = status;
-    throw error;
-  };
-
-  if (route === "/api/me" && method === "GET") {
-    if (!session) fail("Please log in to continue.", 401);
-    return { user: session };
-  }
-  if (route === "/api/auth/register" && method === "POST") {
-    const name = String(payload.name || "").trim();
-    const email = String(payload.email || "").trim().toLowerCase();
-    const password = String(payload.password || "");
-    if (name.length < 2 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || password.length < 10 || password.length > 128) {
-      fail("Enter your name, a valid email, and a password between 10 and 128 characters.");
-    }
-    if (email === "richardcameron185@gmail.com") fail("Administrator sign-in requires the server-enabled deployment.", 403);
-    if (accounts.some((account) => account.email === email)) fail("An account already exists for that email.", 409);
-    const salt = [...window.crypto.getRandomValues(new Uint8Array(16))].map((value) => value.toString(16).padStart(2, "0")).join("");
-    const user = { id: `local-${window.crypto.randomUUID()}`, name, email, role: "student", active: true, createdAt: new Date().toISOString() };
-    accounts.push({ ...user, salt, passwordHash: await offlinePasswordHash(password, salt) });
-    localStorage.setItem(OFFLINE_ACCOUNTS_KEY, JSON.stringify(accounts));
-    localStorage.setItem(OFFLINE_SESSION_KEY, JSON.stringify(user));
-    return { user };
-  }
-  if (route === "/api/auth/login" && method === "POST") {
-    const email = String(payload.email || "").trim().toLowerCase();
-    if (email === "richardcameron185@gmail.com") fail("Administrator sign-in requires the server-enabled deployment.", 403);
-    const account = accounts.find((candidate) => candidate.email === email);
-    if (!account) fail("Email or password is incorrect.", 401);
-    const passwordHash = await offlinePasswordHash(String(payload.password || ""), account.salt);
-    if (passwordHash !== account.passwordHash || !account.active) fail("Email or password is incorrect.", 401);
-    const user = { id: account.id, name: account.name, email: account.email, role: "student", active: true, createdAt: account.createdAt };
-    localStorage.setItem(OFFLINE_SESSION_KEY, JSON.stringify(user));
-    return { user };
-  }
-  if (route === "/api/auth/logout" && method === "POST") {
-    localStorage.removeItem(OFFLINE_SESSION_KEY);
-    return { ok: true };
-  }
-  if (!session) fail("Please log in to continue.", 401);
-  if (route === "/api/books" && method === "GET") return { books: offlineBookCatalog() };
-  if (route === "/api/about" && method === "GET") {
-    return { developers: readLocalJSON(OFFLINE_ABOUT_KEY, [
-      { id: "richard-cameron", name: "Richard Cameron", role: "Lead Developer & Systems Architect", bio: "Builds the library experience, product flow, and technical systems behind a smooth learning environment.", accent: "sage" },
-      { id: "joshua", name: "Joshua", role: "Co-Developer & Product Partner", bio: "Helps shape the academic experience, feature planning, and student-first improvements across the platform.", accent: "gold" }
-    ]) };
-  }
-  if (route === "/api/videos" && method === "GET") return { videos: [] };
-  if (route === "/api/activity" && method === "GET") return { activity: readLocalJSON(OFFLINE_ACTIVITY_KEY, {})[session.id] || [] };
-  const favoriteMatch = route.match(/^\/api\/books\/([^/]+)\/favorite$/);
-  if (favoriteMatch && method === "PUT") {
-    const favorites = readLocalJSON(OFFLINE_FAVORITES_KEY, {});
-    const userFavorites = favorites[session.id] || [];
-    const index = userFavorites.indexOf(favoriteMatch[1]);
-    if (index === -1) userFavorites.push(favoriteMatch[1]);
-    else userFavorites.splice(index, 1);
-    favorites[session.id] = userFavorites;
-    localStorage.setItem(OFFLINE_FAVORITES_KEY, JSON.stringify(favorites));
-    return { favorite: index === -1 };
-  }
-  if (route.startsWith("/api/admin/")) fail("Admin dashboard actions need the server-enabled deployment.", 403);
-  fail("This action is unavailable in static browser mode.", 404);
-}
-
 async function api(url, options = {}) {
-  if (state.offlineMode) return offlineApi(url, options);
   let response;
   try {
     response = await fetch(url, {
@@ -206,14 +66,9 @@ async function api(url, options = {}) {
         : { "Content-Type": "application/json", ...(options.headers || {}) }
     });
   } catch {
-    state.offlineMode = true;
-    return offlineApi(url, options);
+    throw new Error("The library server could not be reached. Check the connection and deployment status.");
   }
   const contentType = response.headers.get("content-type") || "";
-  if (window.location.protocol === "file:" || !contentType.includes("application/json") && response.status >= 200 && response.status < 500) {
-    state.offlineMode = true;
-    return offlineApi(url, options);
-  }
   const result = contentType.includes("application/json") ? await response.json() : null;
   if (!response.ok) {
 
@@ -273,6 +128,19 @@ async function loadLibrary() {
   renderDepartments();
 }
 
+async function loadDepartments() {
+  const result = await api("/api/departments");
+  state.departments = result.departments || [];
+  if (!state.departments.some((department) => department.id === state.departmentId)) {
+    state.departmentId = "";
+    state.category = "All departments";
+  } else {
+    state.category = state.departments.find((department) => department.id === state.departmentId).name;
+  }
+  renderDepartments();
+  if (["home", "department-levels", "department-subjects"].includes(state.view)) renderPage();
+}
+
 async function loadAbout() {
   const result = await api("/api/about");
   state.developers = result.developers || [];
@@ -303,14 +171,13 @@ async function enterLibrary(user) {
   }
   state.view = "home";
   state.category = "All departments";
-  await Promise.all([loadAbout(), loadLibrary(), loadVideos()]);
+  await Promise.all([loadAbout(), loadLibrary(), loadVideos(), loadDepartments()]);
 }
 
 function renderDepartments() {
-  const categories = [...new Set([...DEPARTMENTS, ...state.books.map((book) => book.category)].filter(Boolean))];
-  $("#department-nav").innerHTML = categories.map((category) => `
-    <button class="nav-link${["department-levels", "department-subjects", "subject-books"].includes(state.view) && state.category === category ? " is-active" : ""}" data-department="${escapeHTML(category)}">
-      <span class="nav-icon">↗</span>${escapeHTML(category)}
+  $("#department-nav").innerHTML = state.departments.map((department) => `
+    <button class="nav-link${["department-levels", "department-subjects", "subject-books"].includes(state.view) && state.departmentId === department.id ? " is-active" : ""}" data-department="${escapeHTML(department.id)}">
+      <span class="nav-icon">↗</span>${escapeHTML(department.name)}
     </button>`).join("");
 }
 
@@ -319,36 +186,41 @@ function booksForDepartment(department) {
 }
 
 function renderDepartmentLevels() {
+  const department = state.departments.find((item) => item.id === state.departmentId);
+  if (!department) return renderHome();
   const books = booksForDepartment(state.category);
-  const levels = [...new Set(books.map((book) => bookHierarchy(book).level))];
-  $("#breadcrumb-current").textContent = state.category;
+  const levels = department.levels || [];
+  $("#breadcrumb-current").textContent = department.name;
   pageContent.innerHTML = `
-    <div class="page-intro"><span class="eyebrow">DEPARTMENT LIBRARY</span><h1>${escapeHTML(state.category)}</h1><p>Choose a level to browse its subjects.</p></div>
+    <div class="page-intro"><span class="eyebrow">DEPARTMENT LIBRARY</span><h1>${escapeHTML(department.name)}</h1><p>Choose a level to browse its subjects.</p></div>
     <div class="hierarchy-grid">
       ${levels.length ? levels.map((level) => `
-        <button class="hierarchy-card" data-level="${escapeHTML(level)}">
+        <button class="hierarchy-card" data-level="${escapeHTML(level.id)}">
           <span class="hierarchy-card-icon">▤</span>
-          <span><strong>${escapeHTML(level)}</strong><small>${books.filter((book) => bookHierarchy(book).level === level).length} resources</small></span>
+          <span><strong>${escapeHTML(level.name)}</strong><small>${books.filter((book) => book.levelId === level.id).length} resources</small></span>
           <span class="hierarchy-card-arrow">→</span>
-        </button>`).join("") : '<div class="empty-state"><strong>No resources in this department yet</strong>Resources are grouped by level and subject when they are present in the BOOKS folder.</div>'}
+        </button>`).join("") : '<div class="empty-state"><strong>No levels in this department yet</strong>Add levels from the administrator dashboard.</div>'}
     </div>`;
   syncNavigation();
 }
 
 function renderDepartmentSubjects() {
-  const books = booksForDepartment(state.category).filter((book) => bookHierarchy(book).level === state.selectedLevel);
-  const subjects = [...new Set(books.map((book) => bookHierarchy(book).subject))];
-  $("#breadcrumb-current").textContent = `${state.category} / ${state.selectedLevel}`;
+  const department = state.departments.find((item) => item.id === state.departmentId);
+  const level = department?.levels.find((item) => item.id === state.selectedLevel);
+  if (!department || !level) return renderDepartmentLevels();
+  const books = booksForDepartment(state.category).filter((book) => book.levelId === level.id);
+  const subjects = level.subjects || [];
+  $("#breadcrumb-current").textContent = `${department.name} / ${level.name}`;
   pageContent.innerHTML = `
-    <div class="hierarchy-breadcrumb"><button class="text-button" data-back-to-levels>← ${escapeHTML(state.category)}</button></div>
-    <div class="page-intro"><span class="eyebrow">${escapeHTML(state.category)}</span><h1>${escapeHTML(state.selectedLevel)}</h1><p>Choose a subject to open its learning resources.</p></div>
+    <div class="hierarchy-breadcrumb"><button class="text-button" data-back-to-levels>← ${escapeHTML(department.name)}</button></div>
+    <div class="page-intro"><span class="eyebrow">${escapeHTML(department.name)}</span><h1>${escapeHTML(level.name)}</h1><p>Choose a subject to open its learning resources.</p></div>
     <div class="hierarchy-grid">
       ${subjects.length ? subjects.map((subject) => `
-        <button class="hierarchy-card" data-subject="${escapeHTML(subject)}">
+        <button class="hierarchy-card" data-subject="${escapeHTML(subject.id)}">
           <span class="hierarchy-card-icon">▧</span>
-          <span><strong>${escapeHTML(subject)}</strong><small>${books.filter((book) => bookHierarchy(book).subject === subject).length} resources</small></span>
+          <span><strong>${escapeHTML(subject.name)}</strong><small>${books.filter((book) => book.subjectId === subject.id).length} resources</small></span>
           <span class="hierarchy-card-arrow">→</span>
-        </button>`).join("") : '<div class="empty-state"><strong>No subjects available</strong>This level does not contain any subject folders yet.</div>'}
+        </button>`).join("") : '<div class="empty-state"><strong>No subjects in this level yet</strong>Add subjects from the administrator dashboard.</div>'}
     </div>`;
   syncNavigation();
 }
@@ -381,8 +253,7 @@ function visibleBooks() {
   if (state.view === "category") books = books.filter((book) => book.category === state.category);
   if (state.view === "subject-books") {
     books = books.filter((book) => {
-      const location = bookHierarchy(book);
-      return book.category === state.category && location.level === state.selectedLevel && location.subject === state.selectedSubject;
+      return book.departmentId === state.departmentId && book.levelId === state.selectedLevel && book.subjectId === state.selectedSubject;
     });
   }
   if (state.query) {
@@ -426,10 +297,10 @@ function renderAbout() {
 
 function renderVideos() {
   $("#breadcrumb-current").textContent = "Video lessons";
-  const departments = [...new Set([...DEPARTMENTS, ...state.videos.map((video) => video.category)])];
+  const departments = state.departments;
   const query = state.query.toLocaleLowerCase();
   const videos = state.videos.filter((video) => (
-    (state.videoCategory === "All departments" || video.category === state.videoCategory)
+    (state.videoCategory === "All departments" || video.departmentId === state.videoCategory)
     && (!query || [video.title, video.category, video.description].some((value) => (value || "").toLocaleLowerCase().includes(query)))
   ));
   pageContent.innerHTML = `
@@ -437,7 +308,7 @@ function renderVideos() {
     <label class="field video-filter">Department
       <select id="video-department-filter">
         <option ${state.videoCategory === "All departments" ? "selected" : ""}>All departments</option>
-        ${departments.map((department) => `<option ${state.videoCategory === department ? "selected" : ""}>${escapeHTML(department)}</option>`).join("")}
+        ${departments.map((department) => `<option value="${escapeHTML(department.id)}" ${state.videoCategory === department.id ? "selected" : ""}>${escapeHTML(department.name)}</option>`).join("")}
       </select>
     </label>
     <div class="video-grid">
@@ -454,11 +325,18 @@ function renderVideos() {
 
 function renderHome() {
   const books = visibleBooks();
+  const department = state.departments.find((item) => item.id === state.departmentId);
+  const level = department?.levels.find((item) => item.id === state.selectedLevel);
+  const subject = level?.subjects.find((item) => item.id === state.selectedSubject);
+  const subjectVideos = state.view === "subject-books" ? state.videos.filter((video) => (
+    video.departmentId === state.departmentId && video.levelId === state.selectedLevel && video.subjectId === state.selectedSubject
+    && (!state.query || [video.title, video.description].some((value) => (value || "").toLocaleLowerCase().includes(state.query.toLocaleLowerCase())))
+  )) : [];
   const categoryCount = new Set(state.books.map((book) => book.category)).size;
   const savedCount = state.books.filter((book) => book.favorite).length;
-  const heading = state.view === "saved" ? "Saved books" : state.view === "category" ? state.category : state.view === "subject-books" ? state.selectedSubject : "Explore the collection";
-  const description = state.view === "saved" ? "Your personal reading list, all in one place." : state.view === "category" ? "Resources from this department." : state.view === "subject-books" ? `${state.category} · ${state.selectedLevel}` : "Practical knowledge for every path you're building.";
-  $("#breadcrumb-current").textContent = state.view === "saved" ? "Saved books" : state.view === "category" ? state.category : state.view === "subject-books" ? `${state.category} / ${state.selectedLevel} / ${state.selectedSubject}` : "Discover";
+  const heading = state.view === "saved" ? "Saved books" : state.view === "category" ? state.category : state.view === "subject-books" ? subject?.name || "Subject" : "Explore the collection";
+  const description = state.view === "saved" ? "Your personal reading list, all in one place." : state.view === "category" ? "Resources from this department." : state.view === "subject-books" ? `${department?.name || ""} · ${level?.name || ""}` : "Practical knowledge for every path you're building.";
+  $("#breadcrumb-current").textContent = state.view === "saved" ? "Saved books" : state.view === "category" ? state.category : state.view === "subject-books" ? `${department?.name || ""} / ${level?.name || ""} / ${subject?.name || ""}` : "Discover";
   pageContent.innerHTML = `
     ${state.view === "home" ? `
       <section class="welcome-banner">
@@ -473,12 +351,13 @@ function renderHome() {
       <div class="section-heading"><div><h2>Browse by department</h2><p>Find resources for what you're learning.</p></div></div>
       <div class="category-pills">
         <button class="category-pill${state.category === "All departments" ? " is-active" : ""}" data-category="All departments">All departments</button>
-        ${[...new Set([...DEPARTMENTS, ...state.books.map((book) => book.category)])].map((category) => `<button class="category-pill${state.category === category ? " is-active" : ""}" data-department="${escapeHTML(category)}">${escapeHTML(category)}</button>`).join("")}
+        ${state.departments.map((department) => `<button class="category-pill${state.departmentId === department.id ? " is-active" : ""}" data-department="${escapeHTML(department.id)}">${escapeHTML(department.name)}</button>`).join("")}
       </div>` : `
       <div class="page-intro"><span class="eyebrow">NASAWA LIBRARY</span><h1>${escapeHTML(heading)}</h1><p>${escapeHTML(description)}</p></div>`}
-    ${state.view === "subject-books" ? `<div class="hierarchy-breadcrumb"><button class="text-button" data-back-to-subjects>← ${escapeHTML(state.selectedLevel)} subjects</button></div>` : ""}
+    ${state.view === "subject-books" ? `<div class="hierarchy-breadcrumb"><button class="text-button" data-back-to-subjects>← ${escapeHTML(level?.name || "Level")} subjects</button></div>` : ""}
     <div class="section-heading"><div><h2>${state.view === "home" ? "Recently added" : `${books.length} ${books.length === 1 ? "resource" : "resources"}`}</h2><p>${state.view === "home" ? "A fresh place to start." : "Explore and keep learning."}</p></div>${state.user.role === "admin" && state.view === "home" ? '<button class="button button-quiet button-small" data-action="upload">＋ Add resource</button>' : ""}</div>
     <div class="book-grid">${cardsMarkup(state.view === "home" ? books.slice(0, 8) : books)}</div>
+    ${state.view === "subject-books" ? `<div class="video-grid subject-video-grid">${subjectVideos.map((video) => `<article class="video-card"><video controls preload="metadata" playsinline src="/api/videos/${encodeURIComponent(video.id)}/file">${escapeHTML(video.title)}</video><div class="video-card-copy"><h2>${escapeHTML(video.title)}</h2>${video.description ? `<p>${escapeHTML(video.description)}</p>` : ""}</div></article>`).join("")}</div>` : ""}
     ${state.view === "home" && books.length > 8 ? '<div class="section-heading"><button class="text-button" data-view="all-books">View all resources →</button></div>' : ""}`;
   syncNavigation();
 }
@@ -502,7 +381,7 @@ function syncNavigation() {
     button.classList.toggle("is-active", button.dataset.view === state.view);
   });
   $$(".nav-link", $("#department-nav")).forEach((button) => {
-    button.classList.toggle("is-active", ["department-levels", "department-subjects", "subject-books"].includes(state.view) && button.dataset.department === state.category);
+    button.classList.toggle("is-active", ["department-levels", "department-subjects", "subject-books"].includes(state.view) && button.dataset.department === state.departmentId);
   });
 }
 
@@ -516,6 +395,7 @@ async function renderAdmin() {
     const isUsers = state.adminTab === "users";
     const isVideos = state.adminTab === "videos";
     const isAbout = state.adminTab === "about";
+    const isDepartments = state.adminTab === "departments";
     pageContent.innerHTML = `
       <div class="section-heading">
         <div class="page-intro"><span class="eyebrow">LIBRARY MANAGEMENT</span><h1>Admin dashboard</h1><p>Manage learning resources, people, and the campus story.</p></div>
@@ -535,6 +415,7 @@ async function renderAdmin() {
       <div class="admin-tabs">
         <button class="admin-tab${isBooks ? " is-active" : ""}" data-admin-tab="books">Library catalog</button>
         <button class="admin-tab${isVideos ? " is-active" : ""}" data-admin-tab="videos">Video lessons</button>
+        <button class="admin-tab${isDepartments ? " is-active" : ""}" data-admin-tab="departments">Departments</button>
         <button class="admin-tab${isUsers ? " is-active" : ""}" data-admin-tab="users">User accounts</button>
         <button class="admin-tab${isAbout ? " is-active" : ""}" data-admin-tab="about">About team</button>
       </div>
@@ -548,6 +429,7 @@ async function renderAdmin() {
 async function renderAdminTable() {
   const panel = $("#admin-panel");
   if (!panel) return;
+  if (state.adminTab === "departments") return renderAdminDepartments();
   if (state.adminTab === "about") {
     const { developers } = await api("/api/admin/about");
     panel.innerHTML = `
@@ -584,7 +466,7 @@ async function renderAdminTable() {
       <div class="admin-panel-header"><h2>Library catalog</h2><span>${data.books.length} total resources</span></div>
       <div class="table-wrap"><table class="data-table"><thead><tr><th>RESOURCE</th><th>DEPARTMENT</th><th>FORMAT</th><th>DOWNLOADS</th><th>ACTION</th></tr></thead>
       <tbody>${data.books.length ? data.books.map((book) => `<tr>
-        <td><strong>${escapeHTML(book.title)}</strong><br>${escapeHTML(book.author)}</td><td>${escapeHTML(book.category)}</td>
+        <td><form class="resource-title-form" data-resource-kind="book" data-resource-id="${escapeHTML(book.id)}"><input name="title" value="${escapeHTML(book.title)}" maxlength="140" aria-label="Book title"><button class="button button-quiet button-small" type="submit">Save</button></form><br>${escapeHTML(book.author)}</td><td>${escapeHTML(book.category)} / ${escapeHTML(book.level)} / ${escapeHTML(book.subject)}</td>
         <td>${escapeHTML(book.extension.replace(".", "").toUpperCase())} · ${formatSize(book.size)}</td><td>${book.downloads}</td>
         <td><button class="button button-danger button-small" data-delete-book="${book.id}">Delete</button></td>
       </tr>`).join("") : '<tr><td colspan="5">No resources yet. Upload the first book to get started.</td></tr>'}</tbody></table></div>`;
@@ -593,7 +475,7 @@ async function renderAdminTable() {
       <div class="admin-panel-header"><h2>Video lessons</h2><span>${data.videos.length} total videos</span></div>
       <div class="table-wrap"><table class="data-table"><thead><tr><th>VIDEO</th><th>DEPARTMENT</th><th>FORMAT</th><th>SIZE</th><th>ACTION</th></tr></thead>
       <tbody>${data.videos.length ? data.videos.map((video) => `<tr>
-        <td><strong>${escapeHTML(video.title)}</strong></td><td>${escapeHTML(video.category)}</td>
+        <td><form class="resource-title-form" data-resource-kind="video" data-resource-id="${escapeHTML(video.id)}"><input name="title" value="${escapeHTML(video.title)}" maxlength="140" aria-label="Video title"><button class="button button-quiet button-small" type="submit">Save</button></form></td><td>${escapeHTML(video.category)} / ${escapeHTML(video.level)} / ${escapeHTML(video.subject)}</td>
         <td>${escapeHTML(video.extension.replace(".", "").toUpperCase())}</td><td>${formatSize(video.size)}</td>
         <td><button class="button button-danger button-small" data-delete-video="${escapeHTML(video.id)}">Delete</button></td>
       </tr>`).join("") : '<tr><td colspan="5">No videos yet. Upload the first department lesson.</td></tr>'}</tbody></table></div>`;
@@ -607,6 +489,55 @@ async function renderAdminTable() {
         <td>${user.role === "admin" ? "—" : `<div class="table-actions"><button class="button button-quiet button-small" data-toggle-user="${user.id}" data-active="${user.active}">${user.active ? "Suspend" : "Restore"}</button><button class="button button-danger button-small" data-delete-user="${user.id}">Delete</button></div>`}</td>
       </tr>`).join("") : '<tr><td colspan="5">No accounts found.</td></tr>'}</tbody></table></div>`;
   }
+}
+
+async function renderAdminDepartments() {
+  const panel = $("#admin-panel");
+  const [{ departments }, { books }, { videos }] = await Promise.all([
+    api("/api/admin/departments"), api("/api/admin/books"), api("/api/admin/videos")
+  ]);
+  panel.innerHTML = `
+    <div class="admin-panel-header"><h2>Department structure</h2><span>${departments.length} departments</span></div>
+    <form class="hierarchy-add-form" data-hierarchy-add="department"><label class="field">New department<input name="name" maxlength="100" required></label><button class="button button-primary button-small" type="submit">Add department</button></form>
+    <div class="hierarchy-admin-list">
+      ${departments.map((department) => `
+        <section class="hierarchy-admin-department">
+          <div class="hierarchy-admin-heading">
+            <form class="hierarchy-edit-form" data-hierarchy-edit="department" data-id="${escapeHTML(department.id)}"><input name="name" value="${escapeHTML(department.name)}" maxlength="100" aria-label="Department name"><button class="button button-quiet button-small" type="submit">Save</button><button class="button button-danger button-small" type="button" data-delete-hierarchy="department" data-id="${escapeHTML(department.id)}">Delete</button></form>
+            <form class="hierarchy-add-form" data-hierarchy-add="level" data-parent-id="${escapeHTML(department.id)}"><input name="name" maxlength="80" placeholder="New level" aria-label="New level name" required><button class="button button-quiet button-small" type="submit">Add level</button></form>
+          </div>
+          ${(department.levels || []).map((level) => `
+            <section class="hierarchy-admin-level">
+              <div class="hierarchy-admin-heading">
+                <form class="hierarchy-edit-form" data-hierarchy-edit="level" data-id="${escapeHTML(level.id)}"><input name="name" value="${escapeHTML(level.name)}" maxlength="80" aria-label="Level name"><button class="button button-quiet button-small" type="submit">Save</button><button class="button button-danger button-small" type="button" data-delete-hierarchy="level" data-id="${escapeHTML(level.id)}">Delete</button></form>
+                <form class="hierarchy-add-form" data-hierarchy-add="subject" data-parent-id="${escapeHTML(level.id)}"><input name="name" maxlength="100" placeholder="New subject" aria-label="New subject name" required><button class="button button-quiet button-small" type="submit">Add subject</button></form>
+              </div>
+              ${(level.subjects || []).map((subject) => {
+                const subjectBooks = books.filter((book) => book.subjectId === subject.id);
+                const subjectVideos = videos.filter((video) => video.subjectId === subject.id);
+                const location = `data-department-id="${escapeHTML(department.id)}" data-level-id="${escapeHTML(level.id)}" data-subject-id="${escapeHTML(subject.id)}"`;
+                const resourceLocationFields = (resource) => {
+                  const selectedDepartment = state.departments.find((item) => item.id === resource.departmentId);
+                  const selectedLevel = selectedDepartment?.levels.find((item) => item.id === resource.levelId);
+                  return `<select name="departmentId" data-resource-department aria-label="Resource department">${state.departments.map((item) => `<option value="${escapeHTML(item.id)}" ${item.id === resource.departmentId ? "selected" : ""}>${escapeHTML(item.name)}</option>`).join("")}</select><select name="levelId" data-resource-level aria-label="Resource level">${(selectedDepartment?.levels || []).map((item) => `<option value="${escapeHTML(item.id)}" ${item.id === resource.levelId ? "selected" : ""}>${escapeHTML(item.name)}</option>`).join("")}</select><select name="subjectId" data-resource-subject aria-label="Resource subject">${(selectedLevel?.subjects || []).map((item) => `<option value="${escapeHTML(item.id)}" ${item.id === resource.subjectId ? "selected" : ""}>${escapeHTML(item.name)}</option>`).join("")}</select>`;
+                };
+                return `<section class="hierarchy-admin-subject">
+                  <div class="hierarchy-admin-heading">
+                    <form class="hierarchy-edit-form" data-hierarchy-edit="subject" data-id="${escapeHTML(subject.id)}"><input name="name" value="${escapeHTML(subject.name)}" maxlength="100" aria-label="Subject name"><button class="button button-quiet button-small" type="submit">Save</button><button class="button button-danger button-small" type="button" data-delete-hierarchy="subject" data-id="${escapeHTML(subject.id)}">Delete</button></form>
+                    <span class="hierarchy-resource-count">${subjectBooks.length + subjectVideos.length} resources</span>
+                  </div>
+                  <div class="hierarchy-resource-actions"><button class="button button-quiet button-small" data-upload-subject="book" ${location}>＋ Book</button><button class="button button-quiet button-small" data-upload-subject="video" ${location}>＋ Video</button></div>
+                  <div class="hierarchy-resource-list">
+                    ${subjectBooks.map((book) => `<form class="resource-title-form" data-resource-kind="book" data-resource-id="${escapeHTML(book.id)}"><span>Book</span><input name="title" value="${escapeHTML(book.title)}" maxlength="140" aria-label="Book title">${resourceLocationFields(book)}<button class="button button-quiet button-small" type="submit">Save</button><button class="button button-danger button-small" type="button" data-delete-book="${escapeHTML(book.id)}">Delete</button></form>`).join("")}
+                    ${subjectVideos.map((video) => `<form class="resource-title-form" data-resource-kind="video" data-resource-id="${escapeHTML(video.id)}"><span>Video</span><input name="title" value="${escapeHTML(video.title)}" maxlength="140" aria-label="Video title">${resourceLocationFields(video)}<button class="button button-quiet button-small" type="submit">Save</button><button class="button button-danger button-small" type="button" data-delete-video="${escapeHTML(video.id)}">Delete</button></form>`).join("")}
+                    ${subjectBooks.length + subjectVideos.length ? "" : '<span class="hierarchy-resource-empty">No resources in this subject.</span>'}
+                  </div>
+                </section>`;
+              }).join("")}
+            </section>`).join("")}
+          ${department.levels?.length ? "" : '<p class="hierarchy-resource-empty">No levels added.</p>'}
+        </section>`).join("")}
+    </div>`;
 }
 
 function renderPage() {
@@ -668,7 +599,7 @@ function showBook(bookId) {
   dialog.showModal();
 }
 
-function showUploadDialog(type = "book") {
+function showUploadDialog(type = "book", location = null) {
   const isVideo = type === "video";
   const formId = isVideo ? "video-upload-form" : "upload-form";
   const extensions = isVideo ? ".mp4,.webm,.mov,.m4v" : ".pdf,.doc,.docx,.ppt,.pptx,.pptm,.xls,.xlsx,.txt,.rtf,.csv,.md,.epub,.odt,.ods,.odp,.jpg,.jpeg,.png";
@@ -684,13 +615,40 @@ function showUploadDialog(type = "book") {
           <label class="field">${isVideo ? "Video title" : "Resource title"}<input name="title" maxlength="140" placeholder="e.g. Workshop safety essentials"></label>
           ${isVideo ? "" : '<label class="field">Author or publisher<input name="author" maxlength="100" placeholder="Nasawa Technical College"></label>'}
         </div>
-        <label class="field upload-category-field">Department<select name="category" required>${DEPARTMENTS.map((department) => `<option>${escapeHTML(department)}</option>`).join("")}<option>General</option></select></label>
+        <div class="upload-location-row">
+          <label class="field">Department<select name="departmentId" data-upload-department required><option value="">Select department</option>${state.departments.map((department) => `<option value="${escapeHTML(department.id)}">${escapeHTML(department.name)}</option>`).join("")}</select></label>
+          <label class="field">Level<select name="levelId" data-upload-level required disabled><option value="">Select level</option></select></label>
+          <label class="field">Subject<select name="subjectId" data-upload-subject required disabled><option value="">Select subject</option></select></label>
+        </div>
         <label class="field upload-description-field">About this resource<textarea name="description" rows="3" maxlength="1200" placeholder="A short description to help students choose this resource."></textarea></label>
         <p class="form-message" id="upload-message" aria-live="polite"></p>
       </div>
       <div class="dialog-actions"><button class="button button-quiet" type="button" data-dialog-close>Cancel</button><button class="button button-primary" type="submit">${isVideo ? "Upload video ↑" : "Upload resource ↑"}</button></div>
     </form>`;
   dialog.showModal();
+  const departmentSelect = $(`[data-upload-department]`, dialog);
+  const levelSelect = $(`[data-upload-level]`, dialog);
+  const subjectSelect = $(`[data-upload-subject]`, dialog);
+  const fillSubjects = (levelId, subjectId = "") => {
+    const department = state.departments.find((item) => item.id === departmentSelect.value);
+    const level = department?.levels.find((item) => item.id === levelId);
+    subjectSelect.innerHTML = `<option value="">Select subject</option>${(level?.subjects || []).map((subject) => `<option value="${escapeHTML(subject.id)}">${escapeHTML(subject.name)}</option>`).join("")}`;
+    subjectSelect.disabled = !level;
+    subjectSelect.value = subjectId;
+  };
+  const fillLevels = (departmentId, levelId = "", subjectId = "") => {
+    const department = state.departments.find((item) => item.id === departmentId);
+    levelSelect.innerHTML = `<option value="">Select level</option>${(department?.levels || []).map((level) => `<option value="${escapeHTML(level.id)}">${escapeHTML(level.name)}</option>`).join("")}`;
+    levelSelect.disabled = !department;
+    levelSelect.value = levelId;
+    fillSubjects(levelId, subjectId);
+  };
+  departmentSelect.addEventListener("change", () => fillLevels(departmentSelect.value));
+  levelSelect.addEventListener("change", () => fillSubjects(levelSelect.value));
+  if (location) {
+    departmentSelect.value = location.departmentId;
+    fillLevels(location.departmentId, location.levelId, location.subjectId);
+  }
   const fileInput = $("#upload-file", dialog);
   fileInput.addEventListener("change", () => {
     const file = fileInput.files[0];
@@ -766,7 +724,10 @@ document.addEventListener("click", async (event) => {
   }
   const departmentButton = event.target.closest("[data-department]");
   if (departmentButton) {
-    state.category = departmentButton.dataset.department;
+    const department = state.departments.find((item) => item.id === departmentButton.dataset.department);
+    if (!department) return;
+    state.departmentId = department.id;
+    state.category = department.name;
     state.selectedLevel = "";
     state.selectedSubject = "";
     setView("department-levels");
@@ -802,6 +763,14 @@ document.addEventListener("click", async (event) => {
   if (dialogClose) dialogClose.closest("dialog").close();
   if (action?.dataset.action === "upload") showUploadDialog();
   if (action?.dataset.action === "upload-video") showUploadDialog("video");
+  const subjectUpload = event.target.closest("[data-upload-subject]");
+  if (subjectUpload) {
+    showUploadDialog(subjectUpload.dataset.uploadSubject, {
+      departmentId: subjectUpload.dataset.departmentId,
+      levelId: subjectUpload.dataset.levelId,
+      subjectId: subjectUpload.dataset.subjectId
+    });
+  }
   if (action?.dataset.action === "manage-users") {
     state.adminTab = "users";
     renderAdmin();
@@ -817,6 +786,20 @@ document.addEventListener("click", async (event) => {
       await api(`/api/admin/books/${encodeURIComponent(deleteBook.dataset.deleteBook)}`, { method: "DELETE" });
       notify("Resource deleted.");
       await loadLibrary();
+      await renderAdmin();
+    } catch (error) {
+      notify(error.message, true);
+    }
+  }
+  const deleteHierarchy = event.target.closest("[data-delete-hierarchy]");
+  if (deleteHierarchy && window.confirm(`Delete this ${deleteHierarchy.dataset.deleteHierarchy}? Its nested structure and resources will also be deleted.`)) {
+    const type = deleteHierarchy.dataset.deleteHierarchy;
+    const route = type === "department" ? `/api/admin/departments/${deleteHierarchy.dataset.id}`
+      : type === "level" ? `/api/admin/levels/${deleteHierarchy.dataset.id}` : `/api/admin/subjects/${deleteHierarchy.dataset.id}`;
+    try {
+      await api(route, { method: "DELETE" });
+      await Promise.all([loadDepartments(), loadLibrary(), loadVideos()]);
+      notify(`${type[0].toUpperCase()}${type.slice(1)} deleted.`);
       await renderAdmin();
     } catch (error) {
       notify(error.message, true);
@@ -870,6 +853,46 @@ document.addEventListener("click", async (event) => {
 });
 
 document.addEventListener("submit", async (event) => {
+  const hierarchyAdd = event.target.closest("[data-hierarchy-add]");
+  const hierarchyEdit = event.target.closest("[data-hierarchy-edit]");
+  const resourceEdit = event.target.closest("[data-resource-kind]");
+  if (hierarchyAdd || hierarchyEdit || resourceEdit) {
+    event.preventDefault();
+    const form = event.target;
+    const name = form.elements.name?.value?.trim();
+    try {
+      if (hierarchyAdd) {
+        const type = form.dataset.hierarchyAdd;
+        const route = type === "department" ? "/api/admin/departments"
+          : type === "level" ? `/api/admin/departments/${encodeURIComponent(form.dataset.parentId)}/levels`
+            : `/api/admin/levels/${encodeURIComponent(form.dataset.parentId)}/subjects`;
+        await api(route, { method: "POST", body: JSON.stringify({ name }) });
+      } else if (hierarchyEdit) {
+        const type = form.dataset.hierarchyEdit;
+        const route = type === "department" ? `/api/admin/departments/${encodeURIComponent(form.dataset.id)}`
+          : type === "level" ? `/api/admin/levels/${encodeURIComponent(form.dataset.id)}`
+            : `/api/admin/subjects/${encodeURIComponent(form.dataset.id)}`;
+        await api(route, { method: "PATCH", body: JSON.stringify({ name }) });
+      } else {
+        const type = form.dataset.resourceKind;
+        const route = `/api/admin/${type === "book" ? "books" : "videos"}/${encodeURIComponent(form.dataset.resourceId)}`;
+        const payload = { title: form.elements.title.value };
+        if (form.elements.departmentId) {
+          payload.departmentId = form.elements.departmentId.value;
+          payload.levelId = form.elements.levelId.value;
+          payload.subjectId = form.elements.subjectId.value;
+        }
+        await api(route, { method: "PATCH", body: JSON.stringify(payload) });
+        await Promise.all([loadLibrary(), loadVideos()]);
+      }
+      await Promise.all([loadDepartments(), loadLibrary(), loadVideos()]);
+      notify("Changes saved.");
+      await renderAdmin();
+    } catch (error) {
+      notify(error.message, true);
+    }
+    return;
+  }
   if (event.target.id === "about-form") {
     event.preventDefault();
     const form = event.target;
@@ -920,6 +943,19 @@ document.addEventListener("submit", async (event) => {
 });
 
 document.addEventListener("change", async (event) => {
+  if (event.target.matches("[data-resource-department], [data-resource-level]")) {
+    const form = event.target.closest(".resource-title-form");
+    const departmentSelect = $("[data-resource-department]", form);
+    const levelSelect = $("[data-resource-level]", form);
+    const subjectSelect = $("[data-resource-subject]", form);
+    if (event.target.matches("[data-resource-department]")) {
+      const department = state.departments.find((item) => item.id === departmentSelect.value);
+      levelSelect.innerHTML = (department?.levels || []).map((level) => `<option value="${escapeHTML(level.id)}">${escapeHTML(level.name)}</option>`).join("");
+    }
+    const department = state.departments.find((item) => item.id === departmentSelect.value);
+    const level = department?.levels.find((item) => item.id === levelSelect.value);
+    subjectSelect.innerHTML = (level?.subjects || []).map((subject) => `<option value="${escapeHTML(subject.id)}">${escapeHTML(subject.name)}</option>`).join("");
+  }
   if (event.target.matches("[data-developer-photo]")) {
     const input = event.target;
     const file = input.files[0];
@@ -991,9 +1027,6 @@ async function initialize() {
   } catch (error) {
     if (error.message !== "Please log in to continue.") notify(error.message, true);
     showAuth();
-    if (state.offlineMode) {
-      $("#auth-note").textContent = "Offline browser sign-in is stored on this device. Administrator features require a server.";
-    }
   }
 }
 

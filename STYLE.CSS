@@ -720,6 +720,9 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   .banner-decoration { margin-right: 5%; }
 }
 @media (max-width: 800px) {
+  html, body { width: 100%; max-width: 100%; overflow-x: hidden; }
+  body { font-size: 16px; }
+  .app-shell, .main-area, .page-content { min-width: 0; width: 100%; }
   .auth-screen { grid-template-columns: 1fr; }
   .auth-art { display: none; }
   .auth-panel { min-height: 100vh; padding: 25px; }
@@ -735,6 +738,26 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   .search-box { width: min(240px, 37vw); }
   .topbar-avatar, .notification-button { display: none; }
   .page-content { padding: 22px 18px 40px; }
+  .field { font-size: 14px; }
+  .field input, .field select, .field textarea { min-height: 46px; font-size: 16px; }
+  .button, .icon-button { min-height: 44px; }
+  .upload-location-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr)); gap: 12px; margin-top: 17px; }
+  .category-pills { flex-wrap: wrap; overflow: visible; }
+  .hierarchy-grid { grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr)); }
+  .video-grid { grid-template-columns: repeat(auto-fit, minmax(min(100%, 250px), 1fr)); }
+  .hierarchy-admin-list { display: grid; gap: 12px; padding: 12px; }
+  .hierarchy-admin-department, .hierarchy-admin-level, .hierarchy-admin-subject { min-width: 0; padding: 12px; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
+  .hierarchy-admin-level { margin: 10px 0 0 10px; background: #fafcf9; }
+  .hierarchy-admin-subject { margin: 9px 0 0 10px; background: #fff; }
+  .hierarchy-admin-heading, .hierarchy-edit-form, .hierarchy-add-form, .resource-title-form, .hierarchy-resource-actions { display: flex; align-items: center; gap: 7px; }
+  .hierarchy-admin-heading { flex-wrap: wrap; justify-content: space-between; }
+  .hierarchy-edit-form, .hierarchy-add-form { flex-wrap: wrap; }
+  .hierarchy-edit-form input, .hierarchy-add-form input, .resource-title-form input { width: auto; min-width: 0; flex: 1 1 130px; }
+  .hierarchy-resource-actions { flex-wrap: wrap; margin-top: 8px; }
+  .hierarchy-resource-count, .hierarchy-resource-empty { color: var(--muted); font-size: 13px; }
+  .hierarchy-resource-list { display: grid; gap: 7px; margin-top: 9px; }
+  .resource-title-form { flex-wrap: wrap; min-width: 0; padding: 7px; border-radius: 6px; background: #f7f9f6; }
+  .resource-title-form > span { flex: 0 0 42px; color: var(--muted); font-size: 12px; }
   .welcome-banner { min-height: 175px; padding: 27px; }
   .banner-decoration { width: 100px; height: 100px; margin: 0; font-size: 37px; }
   .stats-strip { margin-bottom: 27px; }
@@ -744,40 +767,86 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   .admin-overview { grid-template-columns: repeat(2, 1fr); }
 }
 @media (max-width: 540px) {
+  body { font-size: 16px; }
   .auth-panel { padding: 20px; }
   .auth-mobile-brand { top: 18px; left: 20px; }
   .auth-card { margin-top: 35px; }
   .auth-heading h2 { font-size: 27px; }
+  .auth-heading p, .auth-note { font-size: 15px; }
   .topbar { padding: 0 12px; }
-  .breadcrumb { gap: 6px; font-size: 10px; }
+  .breadcrumb { min-width: 0; gap: 6px; font-size: 12px; }
+  .breadcrumb strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .search-box { width: 34px; padding: 6px 7px; }
   .search-box input, .search-box kbd { display: none; }
   .search-box:focus-within { position: absolute; right: 56px; width: calc(100% - 140px); }
   .search-box:focus-within input { display: block; }
-  .page-content { padding: 16px 13px 32px; }
+  .page-content { padding: 16px 12px 32px; }
   .welcome-banner { min-height: 160px; padding: 22px 18px; }
-  .banner-copy h1 { font-size: 22px; }
-  .banner-copy p { max-width: 215px; font-size: 10px; }
+  .banner-copy h1 { max-width: 100%; font-size: 24px; }
+  .banner-copy p { max-width: 215px; font-size: 14px; }
   .banner-decoration { width: 66px; height: 66px; font-size: 27px; }
   .banner-decoration::before { width: 6px; height: 6px; top: 3px; right: 9px; }
   .stats-strip { grid-template-columns: repeat(3, 1fr); }
   .stat-item { flex-direction: column; align-items: flex-start; gap: 6px; padding: 10px 8px; }
   .stat-icon { display: none; }
   .stat-value { font-size: 15px; }
-  .stat-label { font-size: 8px; }
+  .stat-label { font-size: 11px; }
   .book-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; }
   .team-grid { grid-template-columns: 1fr; }
   .book-card { padding: 8px; }
   .book-cover { height: 118px; margin-bottom: 10px; }
   .cover-glyph { font-size: 42px; }
+  .book-card h3 { min-height: 40px; font-size: 14px; }
+  .book-author { font-size: 12px; }
+  .book-meta { flex-wrap: wrap; font-size: 11px; }
+  .book-tag { max-width: 100%; }
   .section-heading h2 { font-size: 16px; }
+  .section-heading p, .page-intro p { font-size: 14px; }
+  .page-intro h1 { font-size: 24px; }
+  .button { padding: 10px 12px; font-size: 14px; }
   .upload-fields-row { grid-template-columns: 1fr; }
-  .admin-tabs { width: 100%; }
-  .admin-tab { flex: 1; padding: 8px 5px; }
+  .upload-location-row { grid-template-columns: 1fr; }
+  .admin-tabs { width: 100%; flex-wrap: wrap; }
+  .admin-tab { flex: 1 1 42%; min-width: 0; padding: 9px 5px; font-size: 13px; }
   .section-heading:has(.admin-toolbar) { align-items: flex-start; flex-direction: column; }
-  .admin-toolbar { width: 100%; justify-content: space-between; }
-  .site-footer { padding: 12px 13px; font-size: 8px; }
+  .admin-toolbar { width: 100%; justify-content: flex-start; }
+  .admin-overview { gap: 8px; }
+  .admin-stat { min-width: 0; padding: 12px; }
+  .admin-stat span { font-size: 12px; }
+  .admin-panel-header { gap: 8px; padding: 12px; }
+  .admin-panel-header h2 { font-size: 15px; }
+  .table-wrap { overflow-x: hidden; }
+  .data-table { table-layout: fixed; }
+  .data-table th, .data-table td { min-width: 0; padding: 8px 4px; overflow-wrap: anywhere; font-size: 11px; }
+  .data-table td strong { font-size: 12px; }
+  .table-actions { flex-wrap: wrap; }
+  .data-table .button { min-height: 38px; padding: 7px; font-size: 12px; }
+  .site-footer { flex-wrap: wrap; padding: 12px; font-size: 10px; }
   .site-footer span:last-child { text-align: right; }
+  .dialog-shell { width: calc(100vw - 16px); max-width: calc(100vw - 16px); max-height: 94vh; }
+  .dialog-header, .dialog-body { padding: 15px; }
+  .dialog-actions { flex-wrap: wrap; padding: 0 15px 15px; }
+  .hierarchy-card { min-width: 0; padding: 13px; }
+  .hierarchy-card strong { overflow-wrap: anywhere; font-size: 14px; }
+  .hierarchy-admin-heading, .hierarchy-edit-form, .hierarchy-add-form, .resource-title-form { min-width: 0; flex-wrap: wrap; }
+  .hierarchy-admin-heading input, .resource-title-form input { flex: 1 1 120px; min-width: 0; }
+}
+
+@media (min-width: 801px) {
+  .upload-location-row { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-top: 17px; }
+  .hierarchy-admin-list { display: grid; gap: 14px; padding: 16px; }
+  .hierarchy-admin-department, .hierarchy-admin-level, .hierarchy-admin-subject { min-width: 0; padding: 14px; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
+  .hierarchy-admin-level { margin: 10px 0 0 14px; background: #fafcf9; }
+  .hierarchy-admin-subject { margin: 9px 0 0 14px; background: #fff; }
+  .hierarchy-admin-heading, .hierarchy-edit-form, .hierarchy-add-form, .resource-title-form, .hierarchy-resource-actions { display: flex; align-items: center; gap: 8px; }
+  .hierarchy-admin-heading { flex-wrap: wrap; justify-content: space-between; }
+  .hierarchy-edit-form, .hierarchy-add-form { flex-wrap: wrap; }
+  .hierarchy-edit-form input, .hierarchy-add-form input, .resource-title-form input { width: auto; min-width: 0; flex: 1 1 160px; }
+  .hierarchy-resource-actions { flex-wrap: wrap; margin-top: 9px; }
+  .hierarchy-resource-count, .hierarchy-resource-empty { color: var(--muted); font-size: 11px; }
+  .hierarchy-resource-list { display: grid; gap: 7px; margin-top: 10px; }
+  .resource-title-form { flex-wrap: wrap; min-width: 0; padding: 7px; border-radius: 6px; background: #f7f9f6; }
+  .resource-title-form > span { flex: 0 0 48px; color: var(--muted); font-size: 10px; }
 }
 
 .auth-panel { background: rgba(255, 250, 248, .94); }
