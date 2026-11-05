@@ -6,6 +6,10 @@ const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const { promisify } = require("node:util");
+const { Readable } = require("node:stream");
+const { pipeline } = require("node:stream/promises");
+require("dotenv").config({ path: path.join(__dirname, ".env") });
+const cloudinary = require("cloudinary").v2;
 
 const scrypt = promisify(crypto.scrypt);
 const ROOT = __dirname;
@@ -69,7 +73,10 @@ function normalizeDeveloper(rawDeveloper, index) {
     role: cleanText(rawDeveloper?.role, 80) || DEFAULT_DEVELOPERS[index]?.role || "Developer",
     bio: cleanText(rawDeveloper?.bio, 300) || DEFAULT_DEVELOPERS[index]?.bio || "",
     accent: accentOptions.includes(rawDeveloper?.accent) ? rawDeveloper.accent : defaultAccent(index),
-    photo: typeof rawDeveloper?.photo === "string" && /^[a-f0-9-]{36}\.(?:jpe?g|png)$/i.test(rawDeveloper.photo) ? rawDeveloper.photo : ""
+    photo: typeof rawDeveloper?.photo === "string" && /^[a-f0-9-]{36}\.(?:jpe?g|png)$/i.test(rawDeveloper.photo) ? rawDeveloper.photo : "",
+    photoAsset: rawDeveloper?.photoAsset && typeof rawDeveloper.photoAsset.publicId === "string"
+      && typeof rawDeveloper.photoAsset.secureUrl === "string"
+      ? rawDeveloper.photoAsset : null
   };
 }
 
@@ -211,9 +218,10 @@ function resourceLocation(body) {
   };
 }
 
-function deleteResources(predicate) {
+async function deleteResources(predicate) {
   const removedBooks = store.books.filter(predicate);
   const removedVideos = store.videos.filter(predicate);
+  for (const resource of [...removedBooks, ...removedVideos]) await deleteStoredAsset(resource);
   for (const book of removedBooks) {
     if (book.sourcePath && !store.excludedBookSources.includes(book.sourcePath)) store.excludedBookSources.push(book.sourcePath);
   }
@@ -221,14 +229,6 @@ function deleteResources(predicate) {
   store.books = store.books.filter((book) => !removedIds.has(book.id));
   store.videos = store.videos.filter((video) => !removedIds.has(video.id));
   store.activity = store.activity.filter((item) => !removedIds.has(item.bookId));
-  for (const resource of [...removedBooks, ...removedVideos]) {
-    if (!resource.storedName) continue;
-    try {
-      fs.unlinkSync(path.join(UPLOAD_DIR, resource.storedName));
-    } catch (error) {
-      if (error.code !== "ENOENT") throw error;
-    }
-  }
 }
 
 function sendJson(response, status, value, headers = {}) {
@@ -353,6 +353,11 @@ function publicBook(book, userId) {
   };
 }
 
+function publicDeveloper(developer) {
+  const { photoAsset, ...profile } = developer;
+  return profile;
+}
+
 function publicVideo(video) {
   return {
     id: video.id, title: video.title, category: video.category, description: video.description,
@@ -360,6 +365,107 @@ function publicVideo(video) {
     departmentId: video.departmentId, levelId: video.levelId, subjectId: video.subjectId,
     fileName: video.fileName, extension: video.extension, size: video.size, uploadedAt: video.uploadedAt
   };
+}
+
+function assertCloudinaryConfigured() {
+  const required = ["CLOUDINARY_CLOUD_NAME", "CLOUDINARY_API_KEY", "CLOUDINARY_API_SECRET"];
+  const missing = required.filter((name) => !process.env[name]);
+  if (missing.length) {
+    throw Object.assign(new Error(`Set ${missing.join(", ")} before using Cloudinary uploads.`), { status: 503 });
+  }
+}
+
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET
+});
+
+function uploadToCloudinary(data, resourceType, extension = "") {
+  assertCloudinaryConfigured();
+  const publicId = crypto.randomUUID() + (resourceType === "raw" ? extension : "");
+  const options = {
+    resource_type: resourceType,
+    public_id: publicId,
+    overwrite: false
+  };
+  const createStream = resourceType === "video"
+    ? cloudinary.uploader.upload_chunked_stream
+    : cloudinary.uploader.upload_stream;
+  return new Promise((resolve, reject) => {
+    const stream = createStream.call(cloudinary.uploader, {
+      ...options,
+      ...(resourceType === "video" ? { chunk_size: 20 * 1024 * 1024 } : {})
+    }, (error, result) => {
+      if (error) {
+        reject(error);
+      } else if (result && (resourceType !== "video" || result.done)) {
+        if (!result.secure_url || !result.public_id || !result.resource_type) {
+          reject(new Error("Cloudinary returned an incomplete upload result."));
+        } else {
+          resolve({
+            publicId: result.public_id,
+            resourceType: result.resource_type,
+            secureUrl: result.secure_url
+          });
+        }
+      }
+    });
+    stream.on("error", reject);
+    stream.end(data);
+  });
+}
+
+async function deleteCloudinaryAsset(asset) {
+  if (!asset?.publicId) return;
+  assertCloudinaryConfigured();
+  const result = await cloudinary.uploader.destroy(asset.publicId, {
+    resource_type: asset.resourceType,
+    invalidate: true
+  });
+  if (result.result !== "ok" && result.result !== "not found") {
+    throw new Error(`Cloudinary could not delete asset ${asset.publicId}.`);
+  }
+}
+
+async function deleteStoredAsset(resource) {
+  if (resource.cloudinaryAsset) {
+    await deleteCloudinaryAsset(resource.cloudinaryAsset);
+    return;
+  }
+  if (!resource.storedName) return;
+  try {
+    fs.unlinkSync(path.join(UPLOAD_DIR, resource.storedName));
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+}
+
+async function serveCloudinaryAsset(request, response, asset, fileName, disposition) {
+  if (!asset?.secureUrl || !asset.secureUrl.startsWith("https://res.cloudinary.com/")) {
+    throw new Error("The stored Cloudinary URL is invalid.");
+  }
+  const headers = {};
+  if (request.headers.range) headers.Range = request.headers.range;
+  const upstream = await fetch(asset.secureUrl, { headers });
+  if (![200, 206, 416].includes(upstream.status)) {
+    await upstream.body?.cancel();
+    throw Object.assign(new Error("Cloudinary could not serve this file."), { status: 502 });
+  }
+  const responseHeaders = {
+    "Content-Type": MIME_TYPES[path.extname(fileName).toLowerCase()] || "application/octet-stream",
+    "Content-Disposition": disposition === "attachment" ? fileNameHeader(fileName) : inlineFileHeader(fileName),
+    "Accept-Ranges": "bytes",
+    "X-Content-Type-Options": "nosniff",
+    "Cache-Control": "private, no-store"
+  };
+  const contentLength = upstream.headers.get("content-length");
+  const contentRange = upstream.headers.get("content-range");
+  if (contentLength) responseHeaders["Content-Length"] = contentLength;
+  if (contentRange) responseHeaders["Content-Range"] = contentRange;
+  response.writeHead(upstream.status, responseHeaders);
+  if (!upstream.body) return response.end();
+  await pipeline(Readable.fromWeb(upstream.body), response);
 }
 
 function importBooksFromFolder() {
@@ -548,7 +654,7 @@ async function handleApi(request, response, url) {
       saveStore();
       return sendJson(response, 200, { department });
     }
-    deleteResources((resource) => resource.departmentId === department.id);
+    await deleteResources((resource) => resource.departmentId === department.id);
     store.departments = store.departments.filter((item) => item.id !== department.id);
     saveStore();
     return sendJson(response, 200, { ok: true });
@@ -584,7 +690,7 @@ async function handleApi(request, response, url) {
       saveStore();
       return sendJson(response, 200, { level: found.level });
     }
-    deleteResources((resource) => resource.levelId === found.level.id);
+    await deleteResources((resource) => resource.levelId === found.level.id);
     found.department.levels = found.department.levels.filter((item) => item.id !== found.level.id);
     saveStore();
     return sendJson(response, 200, { ok: true });
@@ -620,7 +726,7 @@ async function handleApi(request, response, url) {
       saveStore();
       return sendJson(response, 200, { subject: found.subject });
     }
-    deleteResources((resource) => resource.subjectId === found.subject.id);
+    await deleteResources((resource) => resource.subjectId === found.subject.id);
     found.level.subjects = found.level.subjects.filter((item) => item.id !== found.subject.id);
     saveStore();
     return sendJson(response, 200, { ok: true });
@@ -641,14 +747,18 @@ async function handleApi(request, response, url) {
   }
 
   if (pathname === "/api/about" && method === "GET") {
-    return sendJson(response, 200, { developers: store.developers.map((developer) => ({ ...developer })) });
+    return sendJson(response, 200, { developers: store.developers.map(publicDeveloper) });
   }
 
   const profilePhotoMatch = pathname.match(/^\/api\/about\/photos\/([a-f0-9-]{36}\.(?:jpe?g|png))$/i);
   if (profilePhotoMatch && method === "GET") {
     const photoName = profilePhotoMatch[1];
-    if (!store.developers.some((developer) => developer.photo === photoName)) {
+    const developer = store.developers.find((item) => item.photo === photoName);
+    if (!developer) {
       return sendError(response, 404, "This profile photo is no longer available.");
+    }
+    if (developer.photoAsset) {
+      return serveCloudinaryAsset(request, response, developer.photoAsset, photoName, "inline");
     }
     const photoPath = path.join(UPLOAD_DIR, photoName);
     if (!fs.existsSync(photoPath)) return sendError(response, 404, "The profile photo could not be found.");
@@ -669,6 +779,9 @@ async function handleApi(request, response, url) {
   if (videoFileMatch && method === "GET") {
     const video = store.videos.find((candidate) => candidate.id === videoFileMatch[1]);
     if (!video) return sendError(response, 404, "This video is no longer available.");
+    if (video.cloudinaryAsset) {
+      return serveCloudinaryAsset(request, response, video.cloudinaryAsset, video.fileName, "inline");
+    }
     const filePath = path.join(UPLOAD_DIR, video.storedName);
     if (!fs.existsSync(filePath)) return sendError(response, 404, "The video file could not be found.");
     const fileSize = fs.statSync(filePath).size;
@@ -712,9 +825,25 @@ async function handleApi(request, response, url) {
   if (fileMatch && method === "GET") {
     const book = store.books.find((candidate) => candidate.id === fileMatch[1]);
     if (!book) return sendError(response, 404, "This book is no longer available.");
+    const isDownload = url.searchParams.get("download") === "1";
+    if (book.cloudinaryAsset) {
+      if (isDownload) {
+        book.downloads = (book.downloads || 0) + 1;
+        recordActivity(user.id, book.id, "downloaded");
+        saveStore();
+      } else {
+        book.reads = (book.reads || 0) + 1;
+        recordActivity(user.id, book.id, "opened");
+        saveStore();
+      }
+      const previewable = [".pdf", ".txt", ".md", ".csv", ".jpg", ".jpeg", ".png"].includes(book.extension);
+      return serveCloudinaryAsset(
+        request, response, book.cloudinaryAsset, book.fileName,
+        isDownload || !previewable ? "attachment" : "inline"
+      );
+    }
     const filePath = path.join(UPLOAD_DIR, book.storedName);
     if (!fs.existsSync(filePath)) return sendError(response, 404, "The library file could not be found.");
-    const isDownload = url.searchParams.get("download") === "1";
     if (isDownload) {
       book.downloads = (book.downloads || 0) + 1;
       recordActivity(user.id, book.id, "downloaded");
@@ -759,7 +888,7 @@ async function handleApi(request, response, url) {
 
   if (pathname === "/api/admin/about" && method === "GET") {
     if (!requireAdmin(request, response)) return;
-    return sendJson(response, 200, { developers: store.developers.map((developer) => ({ ...developer })) });
+    return sendJson(response, 200, { developers: store.developers.map(publicDeveloper) });
   }
 
   if (pathname === "/api/admin/about" && method === "PUT") {
@@ -768,11 +897,15 @@ async function handleApi(request, response, url) {
     if (!Array.isArray(body.developers)) return sendError(response, 400, "Provide a list of developer profiles.");
     const developers = body.developers.slice(0, 6).map((developer, index) => {
       const existing = store.developers.find((profile) => profile.id === developer?.id);
-      return normalizeDeveloper({ ...developer, photo: existing?.photo || developer?.photo }, index);
+      return normalizeDeveloper({
+        ...developer,
+        photo: existing?.photo || developer?.photo,
+        photoAsset: existing?.photoAsset || null
+      }, index);
     });
     store.developers = developers;
     saveStore();
-    return sendJson(response, 200, { developers });
+    return sendJson(response, 200, { developers: developers.map(publicDeveloper) });
   }
 
   if (pathname === "/api/admin/about/photo" && method === "POST") {
@@ -790,19 +923,13 @@ async function handleApi(request, response, url) {
     const extension = path.extname(fileName).toLowerCase();
     if (![".jpg", ".jpeg", ".png"].includes(extension)) return sendError(response, 415, "Profile photos must be JPG or PNG images.");
     if (upload.data.length > MAX_PROFILE_PHOTO_BYTES) return sendError(response, 413, "Profile photos must be 5 MB or smaller.");
-    const storedName = `${crypto.randomUUID()}${extension}`;
-    fs.writeFileSync(path.join(UPLOAD_DIR, storedName), upload.data, { flag: "wx", mode: 0o600 });
-    const oldPhoto = developer.photo;
-    developer.photo = storedName;
+    const oldPhoto = { storedName: developer.photo, cloudinaryAsset: developer.photoAsset };
+    const photoAsset = await uploadToCloudinary(upload.data, "image");
+    developer.photo = `${crypto.randomUUID()}${extension}`;
+    developer.photoAsset = photoAsset;
     saveStore();
-    if (oldPhoto && !store.developers.some((profile) => profile.photo === oldPhoto)) {
-      try {
-        fs.unlinkSync(path.join(UPLOAD_DIR, oldPhoto));
-      } catch (error) {
-        if (error.code !== "ENOENT") throw error;
-      }
-    }
-    return sendJson(response, 200, { developer: { ...developer } });
+    await deleteStoredAsset(oldPhoto);
+    return sendJson(response, 200, { developer: publicDeveloper(developer) });
   }
 
   const profilePhotoDeleteMatch = pathname.match(/^\/api\/admin\/about\/photo\/([a-z0-9-]{1,80})$/i);
@@ -810,17 +937,12 @@ async function handleApi(request, response, url) {
     if (!requireAdmin(request, response)) return;
     const developer = store.developers.find((profile) => profile.id === profilePhotoDeleteMatch[1]);
     if (!developer) return sendError(response, 404, "This developer profile could not be found.");
-    const oldPhoto = developer.photo;
+    const oldPhoto = { storedName: developer.photo, cloudinaryAsset: developer.photoAsset };
     developer.photo = "";
+    developer.photoAsset = null;
     saveStore();
-    if (oldPhoto && !store.developers.some((profile) => profile.photo === oldPhoto)) {
-      try {
-        fs.unlinkSync(path.join(UPLOAD_DIR, oldPhoto));
-      } catch (error) {
-        if (error.code !== "ENOENT") throw error;
-      }
-    }
-    return sendJson(response, 200, { developer: { ...developer } });
+    await deleteStoredAsset(oldPhoto);
+    return sendJson(response, 200, { developer: publicDeveloper(developer) });
   }
 
   if (pathname === "/api/admin/videos" && method === "POST") {
@@ -839,11 +961,10 @@ async function handleApi(request, response, url) {
     const title = cleanText(values.title, 140) || path.basename(fileName, extension).replace(/[_-]+/g, " ");
     if (!title) return sendError(response, 400, "A video title is required.");
     const location = resourceLocation(values);
-    const storedName = `${crypto.randomUUID()}${extension}`;
-    fs.writeFileSync(path.join(UPLOAD_DIR, storedName), upload.data, { flag: "wx", mode: 0o600 });
+    const cloudinaryAsset = await uploadToCloudinary(upload.data, "video");
     const video = {
       id: crypto.randomUUID(), title, ...location, description: cleanText(values.description, 1200),
-      fileName, extension, storedName, size: upload.data.length, uploadedAt: new Date().toISOString()
+      fileName, extension, cloudinaryAsset, size: upload.data.length, uploadedAt: new Date().toISOString()
     };
     store.videos.push(video);
     saveStore();
@@ -875,14 +996,11 @@ async function handleApi(request, response, url) {
     if (!requireAdmin(request, response)) return;
     const index = store.videos.findIndex((video) => video.id === adminVideoMatch[1]);
     if (index === -1) return sendError(response, 404, "This video has already been removed.");
-    const [video] = store.videos.splice(index, 1);
+    const video = store.videos[index];
+    await deleteStoredAsset(video);
+    store.videos.splice(index, 1);
     store.activity = store.activity.filter((item) => item.bookId !== video.id);
     saveStore();
-    try {
-      fs.unlinkSync(path.join(UPLOAD_DIR, video.storedName));
-    } catch (error) {
-      if (error.code !== "ENOENT") throw error;
-    }
     return sendJson(response, 200, { ok: true });
   }
 
@@ -902,12 +1020,11 @@ async function handleApi(request, response, url) {
     const title = cleanText(values.title, 140) || path.basename(fileName, extension).replace(/[_-]+/g, " ");
     if (!title) return sendError(response, 400, "A book title is required.");
     const location = resourceLocation(values);
-    const storedName = `${crypto.randomUUID()}${extension}`;
-    fs.writeFileSync(path.join(UPLOAD_DIR, storedName), upload.data, { flag: "wx", mode: 0o600 });
+    const cloudinaryAsset = await uploadToCloudinary(upload.data, "raw", extension);
     const book = {
       id: crypto.randomUUID(), title, author: cleanText(values.author, 100) || "Nasawa Technical College",
       ...location, description: cleanText(values.description, 1200), fileName, extension,
-      storedName, size: upload.data.length, uploadedAt: new Date().toISOString(),
+      cloudinaryAsset, size: upload.data.length, uploadedAt: new Date().toISOString(),
       downloads: 0, reads: 0, favorites: []
     };
     store.books.push(book);
@@ -941,17 +1058,14 @@ async function handleApi(request, response, url) {
     if (!requireAdmin(request, response)) return;
     const index = store.books.findIndex((book) => book.id === adminBookMatch[1]);
     if (index === -1) return sendError(response, 404, "This book has already been removed.");
-    const [book] = store.books.splice(index, 1);
+    const book = store.books[index];
+    await deleteStoredAsset(book);
+    store.books.splice(index, 1);
     store.activity = store.activity.filter((item) => item.bookId !== book.id);
     if (book.sourcePath && !store.excludedBookSources.includes(book.sourcePath)) {
       store.excludedBookSources.push(book.sourcePath);
     }
     saveStore();
-    try {
-      fs.unlinkSync(path.join(UPLOAD_DIR, book.storedName));
-    } catch (error) {
-      if (error.code !== "ENOENT") throw error;
-    }
     return sendJson(response, 200, { ok: true });
   }
 
