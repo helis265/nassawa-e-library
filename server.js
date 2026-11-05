@@ -1,22 +1,21 @@
 "use strict";
 
 // The API and static site share one origin so authentication cookies stay simple.
-const http = require("node:http");
 const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
+const { AsyncLocalStorage } = require("node:async_hooks");
 const { promisify } = require("node:util");
 const { Readable } = require("node:stream");
 const { pipeline } = require("node:stream/promises");
-require("dotenv").config({ path: path.join(__dirname, ".env") });
-const cloudinary = require("cloudinary").v2;
+const express = require("express");
+const cors = require("cors");
+const jwt = require("jsonwebtoken");
+const multer = require("multer");
+const supabase = require("./supabaseClient");
 
 const scrypt = promisify(crypto.scrypt);
 const ROOT = __dirname;
-const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(ROOT, "data"));
-const UPLOAD_DIR = path.join(DATA_DIR, "uploads");
-const BOOKS_DIR = path.resolve(process.env.BOOKS_DIR || path.join(ROOT, "BOOKS"));
-const STORE_FILE = path.join(DATA_DIR, "library.json");
 const PORT = Number(process.env.PORT || 3000);
 const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
 const MAX_VIDEO_UPLOAD_BYTES = 300 * 1024 * 1024;
@@ -25,6 +24,22 @@ const MAX_JSON_BYTES = 1024 * 1024;
 const SESSION_COOKIE = "nasawa_session";
 const SESSION_MAX_AGE = 60 * 60 * 24 * 7;
 const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || "richardcameron185@gmail.com").trim().toLowerCase();
+const JWT_SECRET = process.env.JWT_SECRET;
+const storeContext = new AsyncLocalStorage();
+const startupStore = {
+  users: [], books: [], videos: [], departments: [], hierarchyInitialized: false,
+  excludedBookSources: [], activity: [], developers: []
+};
+const store = new Proxy(startupStore, {
+  get(target, property) {
+    return storeContext.getStore()?.state[property] ?? target[property];
+  },
+  set(target, property, value) {
+    const state = storeContext.getStore()?.state || target;
+    state[property] = value;
+    return true;
+  }
+});
 const ALLOWED_EXTENSIONS = new Set([
   ".pdf", ".doc", ".docx", ".ppt", ".pptx", ".pptm", ".xls", ".xlsx", ".txt", ".rtf",
   ".csv", ".md", ".epub", ".odt", ".ods", ".odp", ".jpg", ".jpeg", ".png"
@@ -39,7 +54,6 @@ const MIME_TYPES = {
   ".mp4": "video/mp4", ".webm": "video/webm", ".mov": "video/quicktime",
   ".m4v": "video/x-m4v", ".pptm": "application/vnd.ms-powerpoint.presentation.macroEnabled.12"
 };
-const sessions = new Map();
 const DEFAULT_DEVELOPERS = [
   {
     id: "richard-cameron",
@@ -63,8 +77,6 @@ const DEFAULT_DEPARTMENTS = [
   "Motorcycle Mechanics", "Procurement", "Public Health"
 ];
 
-fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-
 function normalizeDeveloper(rawDeveloper, index) {
   const accentOptions = ["sage", "sand", "blue", "rose", "gold", "lavender"];
   return {
@@ -74,8 +86,8 @@ function normalizeDeveloper(rawDeveloper, index) {
     bio: cleanText(rawDeveloper?.bio, 300) || DEFAULT_DEVELOPERS[index]?.bio || "",
     accent: accentOptions.includes(rawDeveloper?.accent) ? rawDeveloper.accent : defaultAccent(index),
     photo: typeof rawDeveloper?.photo === "string" && /^[a-f0-9-]{36}\.(?:jpe?g|png)$/i.test(rawDeveloper.photo) ? rawDeveloper.photo : "",
-    photoAsset: rawDeveloper?.photoAsset && typeof rawDeveloper.photoAsset.publicId === "string"
-      && typeof rawDeveloper.photoAsset.secureUrl === "string"
+    photoAsset: rawDeveloper?.photoAsset && typeof rawDeveloper.photoAsset.bucket === "string"
+      && typeof rawDeveloper.photoAsset.path === "string"
       ? rawDeveloper.photoAsset : null
   };
 }
@@ -84,46 +96,121 @@ function defaultAccent(index) {
   return ["sage", "gold"][index] || "sage";
 }
 
-// Keep credentials out of every API response, even for administrator listings.
-function readStore() {
-  try {
-    const store = JSON.parse(fs.readFileSync(STORE_FILE, "utf8"));
-    return {
-      users: Array.isArray(store.users) ? store.users : [],
-      books: Array.isArray(store.books) ? store.books : [],
-      videos: Array.isArray(store.videos) ? store.videos : [],
-      departments: Array.isArray(store.departments) ? store.departments : [],
-      hierarchyInitialized: store.hierarchyInitialized === true,
-      excludedBookSources: Array.isArray(store.excludedBookSources) ? store.excludedBookSources : [],
-      activity: Array.isArray(store.activity) ? store.activity : [],
-      developers: Array.isArray(store.developers) && store.developers.length ? store.developers : DEFAULT_DEVELOPERS
-    };
-  } catch (error) {
-    if (error.code === "ENOENT") return { users: [], books: [], videos: [], departments: [], hierarchyInitialized: false, excludedBookSources: [], activity: [], developers: DEFAULT_DEVELOPERS };
-    throw new Error(`Could not read library data: ${error.message}`);
+const COLLECTIONS = ["users", "books", "videos", "departments", "activity", "developers"];
+
+function clone(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+function normalizeStore(rawStore) {
+  const state = {
+    users: Array.isArray(rawStore.users) ? rawStore.users : [],
+    books: Array.isArray(rawStore.books) ? rawStore.books : [],
+    videos: Array.isArray(rawStore.videos) ? rawStore.videos : [],
+    departments: Array.isArray(rawStore.departments) ? rawStore.departments : [],
+    hierarchyInitialized: rawStore.hierarchyInitialized === true,
+    excludedBookSources: Array.isArray(rawStore.excludedBookSources) ? rawStore.excludedBookSources : [],
+    activity: Array.isArray(rawStore.activity) ? rawStore.activity : [],
+    developers: Array.isArray(rawStore.developers) && rawStore.developers.length
+      ? rawStore.developers : DEFAULT_DEVELOPERS
+  };
+  state.developers = state.developers.map(normalizeDeveloper);
+  if (!state.developers.length) {
+    state.developers = DEFAULT_DEVELOPERS.map((developer, index) => normalizeDeveloper(developer, index));
+  }
+  state.departments = state.departments.map((department) => ({
+    id: cleanText(department?.id, 80) || crypto.randomUUID(),
+    name: cleanText(department?.name, 100),
+    levels: (Array.isArray(department?.levels) ? department.levels : []).map((level) => ({
+      id: cleanText(level?.id, 80) || crypto.randomUUID(),
+      name: cleanText(level?.name, 80),
+      subjects: (Array.isArray(level?.subjects) ? level.subjects : []).map((subject) => ({
+        id: cleanText(subject?.id, 80) || crypto.randomUUID(),
+        name: cleanText(subject?.name, 100)
+      })).filter((subject) => subject.name)
+    })).filter((level) => level.name)
+  })).filter((department) => department.name);
+  return state;
+}
+
+async function readStore() {
+  const data = [];
+  const pageSize = 1000;
+  for (let offset = 0; ; offset += pageSize) {
+    const { data: page, error } = await supabase.from("library_records")
+      .select("collection,id,data")
+      .order("collection", { ascending: true })
+      .order("id", { ascending: true })
+      .range(offset, offset + pageSize - 1);
+    if (error) throw new Error(`Could not read library data from Supabase: ${error.message}`);
+    data.push(...page);
+    if (page.length < pageSize) break;
+  }
+  const rawStore = {};
+  for (const collection of COLLECTIONS) rawStore[collection] = [];
+  rawStore.hierarchyInitialized = false;
+  rawStore.excludedBookSources = [];
+  for (const record of data) {
+    if (record.collection === "meta") rawStore[record.id] = record.data.value;
+    else if (rawStore[record.collection]) rawStore[record.collection].push(record.data);
+  }
+  return normalizeStore(rawStore);
+}
+
+function rowsForStore(state) {
+  const rows = [];
+  for (const collection of COLLECTIONS) {
+    for (const item of state[collection]) {
+      rows.push({ collection, id: item.id, data: item });
+    }
+  }
+  rows.push(
+    { collection: "meta", id: "hierarchyInitialized", data: { value: state.hierarchyInitialized } },
+    { collection: "meta", id: "excludedBookSources", data: { value: state.excludedBookSources } }
+  );
+  return rows;
+}
+
+async function persistStoreChanges(previous, current) {
+  const oldRows = new Map(rowsForStore(previous).map((row) => [`${row.collection}:${row.id}`, row]));
+  const newRows = new Map(rowsForStore(current).map((row) => [`${row.collection}:${row.id}`, row]));
+  const upserts = [];
+  const removals = new Map();
+  for (const [key, row] of newRows) {
+    const old = oldRows.get(key);
+    if (!old || JSON.stringify(old.data) !== JSON.stringify(row.data)) upserts.push(row);
+  }
+  for (const [key, row] of oldRows) {
+    if (!newRows.has(key)) {
+      if (!removals.has(row.collection)) removals.set(row.collection, []);
+      removals.get(row.collection).push(row.id);
+    }
+  }
+  for (let offset = 0; offset < upserts.length; offset += 500) {
+    const { error } = await supabase.from("library_records")
+      .upsert(upserts.slice(offset, offset + 500), { onConflict: "collection,id" });
+    if (error) throw new Error(`Could not save library data to Supabase: ${error.message}`);
+  }
+  for (const [collection, ids] of removals) {
+    for (let offset = 0; offset < ids.length; offset += 200) {
+      const { error } = await supabase.from("library_records")
+        .delete().eq("collection", collection).in("id", ids.slice(offset, offset + 200));
+      if (error) throw new Error(`Could not remove library data from Supabase: ${error.message}`);
+    }
   }
 }
 
-let store = readStore();
-store.developers = (Array.isArray(store.developers) ? store.developers : []).map(normalizeDeveloper);
-if (!store.developers.length) store.developers = DEFAULT_DEVELOPERS.map((developer, index) => normalizeDeveloper(developer, index));
-store.departments = store.departments.map((department) => ({
-  id: cleanText(department?.id, 80) || crypto.randomUUID(),
-  name: cleanText(department?.name, 100),
-  levels: (Array.isArray(department?.levels) ? department.levels : []).map((level) => ({
-    id: cleanText(level?.id, 80) || crypto.randomUUID(),
-    name: cleanText(level?.name, 80),
-    subjects: (Array.isArray(level?.subjects) ? level.subjects : []).map((subject) => ({
-      id: cleanText(subject?.id, 80) || crypto.randomUUID(),
-      name: cleanText(subject?.name, 100)
-    })).filter((subject) => subject.name)
-  })).filter((level) => level.name)
-})).filter((department) => department.name);
+let startupSnapshot = clone(startupStore);
 
-function saveStore() {
-  const temporaryFile = `${STORE_FILE}.tmp`;
-  fs.writeFileSync(temporaryFile, JSON.stringify(store, null, 2), { mode: 0o600 });
-  fs.renameSync(temporaryFile, STORE_FILE);
+async function saveStore() {
+  const context = storeContext.getStore();
+  if (context) {
+    await persistStoreChanges(context.before, context.state);
+    context.before = clone(context.state);
+    return;
+  }
+  await persistStoreChanges(startupSnapshot, startupStore);
+  startupSnapshot = clone(startupStore);
 }
 
 function ensureDepartment(name) {
@@ -184,8 +271,6 @@ function initializeHierarchy() {
   store.books.forEach(assignResourceLocation);
   store.videos.forEach(assignResourceLocation);
 }
-
-initializeHierarchy();
 
 function findLevel(levelId) {
   for (const department of store.departments) {
@@ -275,14 +360,13 @@ function clearSessionCookie(response) {
 
 function currentUser(request) {
   const token = cookieValue(request, SESSION_COOKIE);
-  const session = sessions.get(token);
-  if (!session || session.expiresAt < Date.now()) {
-    if (token) sessions.delete(token);
+  if (!token || !JWT_SECRET) return null;
+  try {
+    const session = jwt.verify(token, JWT_SECRET);
+    return store.users.find((candidate) => candidate.id === session.userId && candidate.active) || null;
+  } catch {
     return null;
   }
-  const user = store.users.find((candidate) => candidate.id === session.userId && candidate.active);
-  if (!user) sessions.delete(token);
-  return user || null;
 }
 
 function requireUser(request, response) {
@@ -324,6 +408,14 @@ function readBody(request, maximumBytes) {
 }
 
 async function readJson(request) {
+  if (request.body && typeof request.body === "object" && !Buffer.isBuffer(request.body)) return request.body;
+  if (Buffer.isBuffer(request.body) || typeof request.body === "string") {
+    try {
+      return JSON.parse(request.body.toString("utf8"));
+    } catch {
+      throw Object.assign(new Error("Please provide valid JSON."), { status: 400 });
+    }
+  }
   const body = await readBody(request, MAX_JSON_BYTES);
   try {
     return JSON.parse(body.toString("utf8"));
@@ -367,90 +459,37 @@ function publicVideo(video) {
   };
 }
 
-function assertCloudinaryConfigured() {
-  const required = ["CLOUDINARY_CLOUD_NAME", "CLOUDINARY_API_KEY", "CLOUDINARY_API_SECRET"];
-  const missing = required.filter((name) => !process.env[name]);
-  if (missing.length) {
-    throw Object.assign(new Error(`Set ${missing.join(", ")} before using Cloudinary uploads.`), { status: 503 });
-  }
-}
-
-cloudinary.config({
-  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
-  api_key: process.env.CLOUDINARY_API_KEY,
-  api_secret: process.env.CLOUDINARY_API_SECRET
-});
-
-function uploadToCloudinary(data, resourceType, extension = "") {
-  assertCloudinaryConfigured();
-  const publicId = crypto.randomUUID() + (resourceType === "raw" ? extension : "");
-  const options = {
-    resource_type: resourceType,
-    public_id: publicId,
-    overwrite: false
-  };
-  const createStream = resourceType === "video"
-    ? cloudinary.uploader.upload_chunked_stream
-    : cloudinary.uploader.upload_stream;
-  return new Promise((resolve, reject) => {
-    const stream = createStream.call(cloudinary.uploader, {
-      ...options,
-      ...(resourceType === "video" ? { chunk_size: 20 * 1024 * 1024 } : {})
-    }, (error, result) => {
-      if (error) {
-        reject(error);
-      } else if (result && (resourceType !== "video" || result.done)) {
-        if (!result.secure_url || !result.public_id || !result.resource_type) {
-          reject(new Error("Cloudinary returned an incomplete upload result."));
-        } else {
-          resolve({
-            publicId: result.public_id,
-            resourceType: result.resource_type,
-            secureUrl: result.secure_url
-          });
-        }
-      }
-    });
-    stream.on("error", reject);
-    stream.end(data);
+async function uploadToSupabase(data, bucket, extension = "", contentType = "application/octet-stream") {
+  const assetPath = `${crypto.randomUUID()}${extension}`;
+  const { error } = await supabase.storage.from(bucket).upload(assetPath, data, {
+    contentType,
+    upsert: false
   });
-}
-
-async function deleteCloudinaryAsset(asset) {
-  if (!asset?.publicId) return;
-  assertCloudinaryConfigured();
-  const result = await cloudinary.uploader.destroy(asset.publicId, {
-    resource_type: asset.resourceType,
-    invalidate: true
-  });
-  if (result.result !== "ok" && result.result !== "not found") {
-    throw new Error(`Cloudinary could not delete asset ${asset.publicId}.`);
-  }
+  if (error) throw new Error(`Could not upload file to Supabase Storage: ${error.message}`);
+  return { bucket, path: assetPath };
 }
 
 async function deleteStoredAsset(resource) {
-  if (resource.cloudinaryAsset) {
-    await deleteCloudinaryAsset(resource.cloudinaryAsset);
-    return;
-  }
-  if (!resource.storedName) return;
-  try {
-    fs.unlinkSync(path.join(UPLOAD_DIR, resource.storedName));
-  } catch (error) {
-    if (error.code !== "ENOENT") throw error;
-  }
+  const asset = resource.storageAsset || resource.photoAsset;
+  if (!asset?.bucket || !asset.path) return;
+  const { error } = await supabase.storage.from(asset.bucket).remove([asset.path]);
+  if (error) throw new Error(`Could not delete file from Supabase Storage: ${error.message}`);
 }
 
-async function serveCloudinaryAsset(request, response, asset, fileName, disposition) {
-  if (!asset?.secureUrl || !asset.secureUrl.startsWith("https://res.cloudinary.com/")) {
-    throw new Error("The stored Cloudinary URL is invalid.");
+async function serveSupabaseAsset(request, response, asset, fileName, disposition) {
+  if (!asset?.bucket || !asset.path) {
+    throw new Error("The stored Supabase Storage reference is invalid.");
+  }
+  const { data, error } = await supabase.storage.from(asset.bucket).createSignedUrl(asset.path, 60);
+  if (error || !data?.signedUrl) {
+    throw new Error(`Could not create a Supabase download link: ${error?.message || "No signed URL was returned."}`);
   }
   const headers = {};
   if (request.headers.range) headers.Range = request.headers.range;
-  const upstream = await fetch(asset.secureUrl, { headers });
+  const upstream = await fetch(data.signedUrl, { headers });
   if (![200, 206, 416].includes(upstream.status)) {
     await upstream.body?.cancel();
-    throw Object.assign(new Error("Cloudinary could not serve this file."), { status: 502 });
+    throw Object.assign(new Error("Supabase Storage could not serve this file."), { status: 502 });
   }
   const responseHeaders = {
     "Content-Type": MIME_TYPES[path.extname(fileName).toLowerCase()] || "application/octet-stream",
@@ -466,87 +505,6 @@ async function serveCloudinaryAsset(request, response, asset, fileName, disposit
   response.writeHead(upstream.status, responseHeaders);
   if (!upstream.body) return response.end();
   await pipeline(Readable.fromWeb(upstream.body), response);
-}
-
-function importBooksFromFolder() {
-  if (!fs.existsSync(BOOKS_DIR)) return;
-  const departmentNames = new Map([
-    ["ACCOUNTING", "Accounting"],
-    ["ADMINISTRATIVESTUDIES", "Administrative Studies"],
-    ["AUTOMOBILEMECHANICS", "Automobile Mechanics"],
-    ["BRICKLAYING", "Brick Laying"],
-    ["CARPENTRYANDJOINERY", "Carpentry and Joinery"],
-    ["COMMUNITYDEVELOPMENT", "Community Development"],
-    ["FABLICATIONANDWELDING", "Fabrication and Welding"],
-    ["FABRICATIONANDWELDING", "Fabrication and Welding"],
-    ["GENERALFITTING", "General Fitting"],
-    ["HUMANRESOURCEMANAGEMENT", "Human Resource Management"],
-    ["ICT", "Information and Communication Technology"],
-    ["INFORMATIONANDCOMMUNICATIONTECHNOLOGY", "Information and Communication Technology"],
-    ["MOTORCYCLEMECHANICS", "Motorcycle Mechanics"],
-    ["PROCUREMENT", "Procurement"],
-    ["PUBLICHEALTH", "Public Health"]
-  ]);
-  const importedPaths = new Set([
-    ...store.books.map((book) => book.sourcePath),
-    ...store.excludedBookSources
-  ].filter(Boolean).map((sourcePath) => sourcePath.toLowerCase()));
-  const walk = (directory) => {
-    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
-      const filePath = path.join(directory, entry.name);
-      if (entry.isDirectory()) {
-        walk(filePath);
-        continue;
-      }
-      if (!entry.isFile()) continue;
-      const extension = path.extname(entry.name).toLowerCase();
-      if (!ALLOWED_EXTENSIONS.has(extension)) continue;
-      const sourcePath = path.relative(BOOKS_DIR, filePath);
-      if (importedPaths.has(sourcePath.toLowerCase())) continue;
-      const relativeParts = sourcePath.split(path.sep);
-      const departmentKey = (relativeParts[0] || "").replace(/[^a-z0-9]/gi, "").toUpperCase();
-      const category = departmentNames.get(departmentKey) || "General";
-      const storedName = `${crypto.randomUUID()}${extension}`;
-      fs.copyFileSync(filePath, path.join(UPLOAD_DIR, storedName), fs.constants.COPYFILE_EXCL);
-      const title = path.basename(entry.name, extension).replace(/[_-]+/g, " ").replace(/\s+/g, " ").trim();
-      store.books.push({
-        id: crypto.randomUUID(), title: title || entry.name, author: "Nasawa Technical College",
-        category, description: `Department learning resource${relativeParts.length > 1 ? ` · ${relativeParts.slice(1, -1).join(" · ")}` : ""}.`,
-        fileName: entry.name, extension, storedName, sourcePath: sourcePath.toLowerCase(),
-        size: fs.statSync(filePath).size, uploadedAt: new Date().toISOString(),
-        downloads: 0, reads: 0, favorites: []
-      });
-      importedPaths.add(sourcePath.toLowerCase());
-    }
-  };
-  walk(BOOKS_DIR);
-}
-
-function parseMultipart(buffer, contentType) {
-  // Split on the multipart boundary as bytes so uploaded documents are never decoded as text.
-  const boundaryMatch = contentType.match(/boundary=(?:"([^"]+)"|([^;]+))/i);
-  if (!boundaryMatch) throw Object.assign(new Error("The upload form is missing its boundary."), { status: 400 });
-  const boundary = Buffer.from(`--${(boundaryMatch[1] || boundaryMatch[2]).trim()}`);
-  const parts = [];
-  let start = buffer.indexOf(boundary);
-  while (start !== -1) {
-    start += boundary.length;
-    if (buffer.slice(start, start + 2).toString() === "--") break;
-    if (buffer.slice(start, start + 2).toString() === "\r\n") start += 2;
-    const next = buffer.indexOf(boundary, start);
-    if (next === -1) break;
-    let part = buffer.slice(start, next);
-    if (part.slice(-2).toString() === "\r\n") part = part.slice(0, -2);
-    const separator = part.indexOf(Buffer.from("\r\n\r\n"));
-    if (separator !== -1) {
-      const headers = part.slice(0, separator).toString("utf8");
-      const data = part.slice(separator + 4);
-      const field = headers.match(/content-disposition:\s*form-data;\s*name="([^"]+)"(?:;\s*filename="([^"]*)")?/i);
-      if (field) parts.push({ name: field[1], filename: field[2], data });
-    }
-    start = next;
-  }
-  return parts;
 }
 
 function fileNameHeader(fileName) {
@@ -577,9 +535,8 @@ async function handleApi(request, response, url) {
     // Public registration can only create student accounts; admin access is provisioned at startup.
     const user = { id: crypto.randomUUID(), name, email, salt, passwordHash, role: "student", active: true, createdAt: new Date().toISOString() };
     store.users.push(user);
-    saveStore();
-    const token = crypto.randomBytes(32).toString("hex");
-    sessions.set(token, { userId: user.id, expiresAt: Date.now() + SESSION_MAX_AGE * 1000 });
+    await saveStore();
+    const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: SESSION_MAX_AGE });
     setSessionCookie(response, token);
     return sendJson(response, 201, { user: safeUser(user) });
   }
@@ -594,15 +551,12 @@ async function handleApi(request, response, url) {
     const actual = (await scrypt(password, salt, 64)).toString("hex");
     const matches = crypto.timingSafeEqual(Buffer.from(actual, "hex"), Buffer.from(expected, "hex"));
     if (!user || !matches || !user.active) return sendError(response, 401, "Email or password is incorrect.");
-    const token = crypto.randomBytes(32).toString("hex");
-    sessions.set(token, { userId: user.id, expiresAt: Date.now() + SESSION_MAX_AGE * 1000 });
+    const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: SESSION_MAX_AGE });
     setSessionCookie(response, token);
     return sendJson(response, 200, { user: safeUser(user) });
   }
 
   if (pathname === "/api/auth/logout" && method === "POST") {
-    const token = cookieValue(request, SESSION_COOKIE);
-    sessions.delete(token);
     clearSessionCookie(response);
     return sendJson(response, 200, { ok: true });
   }
@@ -633,7 +587,7 @@ async function handleApi(request, response, url) {
     }
     const department = { id: crypto.randomUUID(), name, levels: [] };
     store.departments.push(department);
-    saveStore();
+    await saveStore();
     return sendJson(response, 201, { department });
   }
 
@@ -651,12 +605,12 @@ async function handleApi(request, response, url) {
       }
       department.name = name;
       [...store.books, ...store.videos].filter((resource) => resource.departmentId === department.id).forEach((resource) => { resource.category = name; });
-      saveStore();
+      await saveStore();
       return sendJson(response, 200, { department });
     }
     await deleteResources((resource) => resource.departmentId === department.id);
     store.departments = store.departments.filter((item) => item.id !== department.id);
-    saveStore();
+    await saveStore();
     return sendJson(response, 200, { ok: true });
   }
 
@@ -671,7 +625,7 @@ async function handleApi(request, response, url) {
     if (department.levels.some((item) => item.name.toLowerCase() === name.toLowerCase())) return sendError(response, 409, "That level already exists in this department.");
     const level = { id: crypto.randomUUID(), name, subjects: [] };
     department.levels.push(level);
-    saveStore();
+    await saveStore();
     return sendJson(response, 201, { level });
   }
 
@@ -687,12 +641,12 @@ async function handleApi(request, response, url) {
       if (found.department.levels.some((item) => item.id !== found.level.id && item.name.toLowerCase() === name.toLowerCase())) return sendError(response, 409, "That level already exists in this department.");
       found.level.name = name;
       [...store.books, ...store.videos].filter((resource) => resource.levelId === found.level.id).forEach((resource) => { resource.level = name; });
-      saveStore();
+      await saveStore();
       return sendJson(response, 200, { level: found.level });
     }
     await deleteResources((resource) => resource.levelId === found.level.id);
     found.department.levels = found.department.levels.filter((item) => item.id !== found.level.id);
-    saveStore();
+    await saveStore();
     return sendJson(response, 200, { ok: true });
   }
 
@@ -707,7 +661,7 @@ async function handleApi(request, response, url) {
     if (found.level.subjects.some((item) => item.name.toLowerCase() === name.toLowerCase())) return sendError(response, 409, "That subject already exists in this level.");
     const subject = { id: crypto.randomUUID(), name };
     found.level.subjects.push(subject);
-    saveStore();
+    await saveStore();
     return sendJson(response, 201, { subject });
   }
 
@@ -723,12 +677,12 @@ async function handleApi(request, response, url) {
       if (found.level.subjects.some((item) => item.id !== found.subject.id && item.name.toLowerCase() === name.toLowerCase())) return sendError(response, 409, "That subject already exists in this level.");
       found.subject.name = name;
       [...store.books, ...store.videos].filter((resource) => resource.subjectId === found.subject.id).forEach((resource) => { resource.subject = name; });
-      saveStore();
+      await saveStore();
       return sendJson(response, 200, { subject: found.subject });
     }
     await deleteResources((resource) => resource.subjectId === found.subject.id);
     found.level.subjects = found.level.subjects.filter((item) => item.id !== found.subject.id);
-    saveStore();
+    await saveStore();
     return sendJson(response, 200, { ok: true });
   }
 
@@ -757,18 +711,8 @@ async function handleApi(request, response, url) {
     if (!developer) {
       return sendError(response, 404, "This profile photo is no longer available.");
     }
-    if (developer.photoAsset) {
-      return serveCloudinaryAsset(request, response, developer.photoAsset, photoName, "inline");
-    }
-    const photoPath = path.join(UPLOAD_DIR, photoName);
-    if (!fs.existsSync(photoPath)) return sendError(response, 404, "The profile photo could not be found.");
-    response.writeHead(200, {
-      "Content-Type": MIME_TYPES[path.extname(photoName).toLowerCase()],
-      "Content-Length": fs.statSync(photoPath).size,
-      "X-Content-Type-Options": "nosniff",
-      "Cache-Control": "private, no-store"
-    });
-    return fs.createReadStream(photoPath).pipe(response);
+    if (!developer.photoAsset) return sendError(response, 404, "The profile photo could not be found.");
+    return serveSupabaseAsset(request, response, developer.photoAsset, photoName, "inline");
   }
 
   if (pathname === "/api/videos" && method === "GET") {
@@ -779,46 +723,8 @@ async function handleApi(request, response, url) {
   if (videoFileMatch && method === "GET") {
     const video = store.videos.find((candidate) => candidate.id === videoFileMatch[1]);
     if (!video) return sendError(response, 404, "This video is no longer available.");
-    if (video.cloudinaryAsset) {
-      return serveCloudinaryAsset(request, response, video.cloudinaryAsset, video.fileName, "inline");
-    }
-    const filePath = path.join(UPLOAD_DIR, video.storedName);
-    if (!fs.existsSync(filePath)) return sendError(response, 404, "The video file could not be found.");
-    const fileSize = fs.statSync(filePath).size;
-    const range = request.headers.range;
-    let start = 0;
-    let end = fileSize - 1;
-    let status = 200;
-    if (range) {
-      const match = range.match(/^bytes=(\d*)-(\d*)$/);
-      if (!match || (!match[1] && !match[2])) {
-        response.writeHead(416, { "Content-Range": `bytes */${fileSize}` });
-        return response.end();
-      }
-      if (!match[1]) {
-        start = Math.max(0, fileSize - Number(match[2]));
-      } else {
-        start = Number(match[1]);
-        end = match[2] ? Number(match[2]) : end;
-      }
-      if (start >= fileSize || end < start) {
-        response.writeHead(416, { "Content-Range": `bytes */${fileSize}` });
-        return response.end();
-      }
-      end = Math.min(end, fileSize - 1);
-      status = 206;
-    }
-    const headers = {
-      "Content-Type": MIME_TYPES[video.extension] || "application/octet-stream",
-      "Content-Length": end - start + 1,
-      "Accept-Ranges": "bytes",
-      "Content-Disposition": inlineFileHeader(video.fileName),
-      "X-Content-Type-Options": "nosniff",
-      "Cache-Control": "private, no-store"
-    };
-    if (status === 206) headers["Content-Range"] = `bytes ${start}-${end}/${fileSize}`;
-    response.writeHead(status, headers);
-    return fs.createReadStream(filePath, { start, end }).pipe(response);
+    if (!video.storageAsset) return sendError(response, 404, "The video file could not be found.");
+    return serveSupabaseAsset(request, response, video.storageAsset, video.fileName, "inline");
   }
 
   const fileMatch = pathname.match(/^\/api\/books\/([a-f0-9-]+)\/file$/i);
@@ -826,42 +732,20 @@ async function handleApi(request, response, url) {
     const book = store.books.find((candidate) => candidate.id === fileMatch[1]);
     if (!book) return sendError(response, 404, "This book is no longer available.");
     const isDownload = url.searchParams.get("download") === "1";
-    if (book.cloudinaryAsset) {
-      if (isDownload) {
-        book.downloads = (book.downloads || 0) + 1;
-        recordActivity(user.id, book.id, "downloaded");
-        saveStore();
-      } else {
-        book.reads = (book.reads || 0) + 1;
-        recordActivity(user.id, book.id, "opened");
-        saveStore();
-      }
-      const previewable = [".pdf", ".txt", ".md", ".csv", ".jpg", ".jpeg", ".png"].includes(book.extension);
-      return serveCloudinaryAsset(
-        request, response, book.cloudinaryAsset, book.fileName,
-        isDownload || !previewable ? "attachment" : "inline"
-      );
-    }
-    const filePath = path.join(UPLOAD_DIR, book.storedName);
-    if (!fs.existsSync(filePath)) return sendError(response, 404, "The library file could not be found.");
+    if (!book.storageAsset) return sendError(response, 404, "The library file could not be found.");
     if (isDownload) {
       book.downloads = (book.downloads || 0) + 1;
       recordActivity(user.id, book.id, "downloaded");
-      saveStore();
     } else {
       book.reads = (book.reads || 0) + 1;
       recordActivity(user.id, book.id, "opened");
-      saveStore();
     }
+    await saveStore();
     const previewable = [".pdf", ".txt", ".md", ".csv", ".jpg", ".jpeg", ".png"].includes(book.extension);
-    response.writeHead(200, {
-      "Content-Type": MIME_TYPES[book.extension] || "application/octet-stream",
-      "Content-Length": fs.statSync(filePath).size,
-      "Content-Disposition": isDownload || !previewable ? fileNameHeader(book.fileName) : inlineFileHeader(book.fileName),
-      "X-Content-Type-Options": "nosniff",
-      "Cache-Control": "private, no-store"
-    });
-    return fs.createReadStream(filePath).pipe(response);
+    return serveSupabaseAsset(
+      request, response, book.storageAsset, book.fileName,
+      isDownload || !previewable ? "attachment" : "inline"
+    );
   }
 
   const favoriteMatch = pathname.match(/^\/api\/books\/([a-f0-9-]+)\/favorite$/i);
@@ -872,7 +756,7 @@ async function handleApi(request, response, url) {
     const index = book.favorites.indexOf(user.id);
     if (index === -1) book.favorites.push(user.id);
     else book.favorites.splice(index, 1);
-    saveStore();
+    await saveStore();
     return sendJson(response, 200, { favorite: index === -1 });
   }
 
@@ -904,7 +788,7 @@ async function handleApi(request, response, url) {
       }, index);
     });
     store.developers = developers;
-    saveStore();
+    await saveStore();
     return sendJson(response, 200, { developers: developers.map(publicDeveloper) });
   }
 
@@ -912,22 +796,19 @@ async function handleApi(request, response, url) {
     if (!requireAdmin(request, response)) return;
     const contentType = request.headers["content-type"] || "";
     if (!contentType.toLowerCase().startsWith("multipart/form-data")) return sendError(response, 400, "Profile photos must be uploaded using the photo form.");
-    const body = await readBody(request, MAX_PROFILE_PHOTO_BYTES + 64 * 1024);
-    const parts = parseMultipart(body, contentType);
-    const values = Object.fromEntries(parts.filter((part) => !part.filename).map((part) => [part.name, part.data.toString("utf8")]));
-    const upload = parts.find((part) => part.name === "file" && part.filename);
-    if (!upload || !upload.data.length) return sendError(response, 400, "Choose a profile photo.");
-    const developer = store.developers.find((profile) => profile.id === values.developerId);
+    const upload = request.file;
+    if (!upload || !upload.buffer.length) return sendError(response, 400, "Choose a profile photo.");
+    const developer = store.developers.find((profile) => profile.id === request.body.developerId);
     if (!developer) return sendError(response, 404, "This developer profile could not be found.");
-    const fileName = path.basename(upload.filename).replace(/[\u0000-\u001f\u007f]/g, "").slice(0, 180);
+    const fileName = path.basename(upload.originalname).replace(/[\u0000-\u001f\u007f]/g, "").slice(0, 180);
     const extension = path.extname(fileName).toLowerCase();
     if (![".jpg", ".jpeg", ".png"].includes(extension)) return sendError(response, 415, "Profile photos must be JPG or PNG images.");
-    if (upload.data.length > MAX_PROFILE_PHOTO_BYTES) return sendError(response, 413, "Profile photos must be 5 MB or smaller.");
-    const oldPhoto = { storedName: developer.photo, cloudinaryAsset: developer.photoAsset };
-    const photoAsset = await uploadToCloudinary(upload.data, "image");
-    developer.photo = `${crypto.randomUUID()}${extension}`;
+    if (upload.size > MAX_PROFILE_PHOTO_BYTES) return sendError(response, 413, "Profile photos must be 5 MB or smaller.");
+    const oldPhoto = { photoAsset: developer.photoAsset };
+    const photoAsset = await uploadToSupabase(upload.buffer, "profile-photos", extension, upload.mimetype);
+    developer.photo = photoAsset.path;
     developer.photoAsset = photoAsset;
-    saveStore();
+    await saveStore();
     await deleteStoredAsset(oldPhoto);
     return sendJson(response, 200, { developer: publicDeveloper(developer) });
   }
@@ -937,10 +818,10 @@ async function handleApi(request, response, url) {
     if (!requireAdmin(request, response)) return;
     const developer = store.developers.find((profile) => profile.id === profilePhotoDeleteMatch[1]);
     if (!developer) return sendError(response, 404, "This developer profile could not be found.");
-    const oldPhoto = { storedName: developer.photo, cloudinaryAsset: developer.photoAsset };
+    const oldPhoto = { photoAsset: developer.photoAsset };
     developer.photo = "";
     developer.photoAsset = null;
-    saveStore();
+    await saveStore();
     await deleteStoredAsset(oldPhoto);
     return sendJson(response, 200, { developer: publicDeveloper(developer) });
   }
@@ -949,25 +830,23 @@ async function handleApi(request, response, url) {
     if (!requireAdmin(request, response)) return;
     const contentType = request.headers["content-type"] || "";
     if (!contentType.toLowerCase().startsWith("multipart/form-data")) return sendError(response, 400, "Video uploads must use a multipart form.");
-    const body = await readBody(request, MAX_VIDEO_UPLOAD_BYTES + 256 * 1024);
-    const parts = parseMultipart(body, contentType);
-    const values = Object.fromEntries(parts.filter((part) => !part.filename).map((part) => [part.name, part.data.toString("utf8")]));
-    const upload = parts.find((part) => part.name === "file" && part.filename);
-    if (!upload || !upload.data.length) return sendError(response, 400, "Choose a video to upload.");
-    const fileName = path.basename(upload.filename).replace(/[\u0000-\u001f\u007f]/g, "").slice(0, 180);
+    const upload = request.file;
+    const values = request.body;
+    if (!upload || !upload.buffer.length) return sendError(response, 400, "Choose a video to upload.");
+    const fileName = path.basename(upload.originalname).replace(/[\u0000-\u001f\u007f]/g, "").slice(0, 180);
     const extension = path.extname(fileName).toLowerCase();
     if (!VIDEO_EXTENSIONS.has(extension)) return sendError(response, 415, "Videos must be MP4, WebM, MOV, or M4V.");
-    if (upload.data.length > MAX_VIDEO_UPLOAD_BYTES) return sendError(response, 413, "Videos must be 300 MB or smaller.");
+    if (upload.size > MAX_VIDEO_UPLOAD_BYTES) return sendError(response, 413, "Videos must be 300 MB or smaller.");
     const title = cleanText(values.title, 140) || path.basename(fileName, extension).replace(/[_-]+/g, " ");
     if (!title) return sendError(response, 400, "A video title is required.");
     const location = resourceLocation(values);
-    const cloudinaryAsset = await uploadToCloudinary(upload.data, "video");
+    const storageAsset = await uploadToSupabase(upload.buffer, "videos", extension, upload.mimetype);
     const video = {
       id: crypto.randomUUID(), title, ...location, description: cleanText(values.description, 1200),
-      fileName, extension, cloudinaryAsset, size: upload.data.length, uploadedAt: new Date().toISOString()
+      fileName, extension, storageAsset, size: upload.size, uploadedAt: new Date().toISOString()
     };
     store.videos.push(video);
-    saveStore();
+    await saveStore();
     return sendJson(response, 201, { video: publicVideo(video) });
   }
 
@@ -987,7 +866,7 @@ async function handleApi(request, response, url) {
     video.title = title;
     video.description = cleanText(body.description, 1200);
     if (body.departmentId || body.levelId || body.subjectId) Object.assign(video, resourceLocation(body));
-    saveStore();
+    await saveStore();
     return sendJson(response, 200, { video: publicVideo(video) });
   }
 
@@ -1000,7 +879,7 @@ async function handleApi(request, response, url) {
     await deleteStoredAsset(video);
     store.videos.splice(index, 1);
     store.activity = store.activity.filter((item) => item.bookId !== video.id);
-    saveStore();
+    await saveStore();
     return sendJson(response, 200, { ok: true });
   }
 
@@ -1008,27 +887,25 @@ async function handleApi(request, response, url) {
     if (!requireAdmin(request, response)) return;
     const contentType = request.headers["content-type"] || "";
     if (!contentType.toLowerCase().startsWith("multipart/form-data")) return sendError(response, 400, "Book uploads must use a multipart form.");
-    const body = await readBody(request, MAX_UPLOAD_BYTES + 256 * 1024);
-    const parts = parseMultipart(body, contentType);
-    const values = Object.fromEntries(parts.filter((part) => !part.filename).map((part) => [part.name, part.data.toString("utf8")]));
-    const upload = parts.find((part) => part.name === "file" && part.filename);
-    if (!upload || !upload.data.length) return sendError(response, 400, "Choose a file to upload.");
-    const fileName = path.basename(upload.filename).replace(/[\u0000-\u001f\u007f]/g, "").slice(0, 180);
+    const upload = request.file;
+    const values = request.body;
+    if (!upload || !upload.buffer.length) return sendError(response, 400, "Choose a file to upload.");
+    const fileName = path.basename(upload.originalname).replace(/[\u0000-\u001f\u007f]/g, "").slice(0, 180);
     const extension = path.extname(fileName).toLowerCase();
     if (!ALLOWED_EXTENSIONS.has(extension)) return sendError(response, 415, "This file type is not supported.");
-    if (upload.data.length > MAX_UPLOAD_BYTES) return sendError(response, 413, "Files must be 50 MB or smaller.");
+    if (upload.size > MAX_UPLOAD_BYTES) return sendError(response, 413, "Files must be 50 MB or smaller.");
     const title = cleanText(values.title, 140) || path.basename(fileName, extension).replace(/[_-]+/g, " ");
     if (!title) return sendError(response, 400, "A book title is required.");
     const location = resourceLocation(values);
-    const cloudinaryAsset = await uploadToCloudinary(upload.data, "raw", extension);
+    const storageAsset = await uploadToSupabase(upload.buffer, "books", extension, upload.mimetype);
     const book = {
       id: crypto.randomUUID(), title, author: cleanText(values.author, 100) || "Nasawa Technical College",
       ...location, description: cleanText(values.description, 1200), fileName, extension,
-      cloudinaryAsset, size: upload.data.length, uploadedAt: new Date().toISOString(),
+      storageAsset, size: upload.size, uploadedAt: new Date().toISOString(),
       downloads: 0, reads: 0, favorites: []
     };
     store.books.push(book);
-    saveStore();
+    await saveStore();
     return sendJson(response, 201, { book: publicBook(book, user.id) });
   }
 
@@ -1049,7 +926,7 @@ async function handleApi(request, response, url) {
     book.author = cleanText(body.author, 100) || book.author;
     book.description = cleanText(body.description, 1200);
     if (body.departmentId || body.levelId || body.subjectId) Object.assign(book, resourceLocation(body));
-    saveStore();
+    await saveStore();
     return sendJson(response, 200, { book: publicBook(book, user.id) });
   }
 
@@ -1065,7 +942,7 @@ async function handleApi(request, response, url) {
     if (book.sourcePath && !store.excludedBookSources.includes(book.sourcePath)) {
       store.excludedBookSources.push(book.sourcePath);
     }
-    saveStore();
+    await saveStore();
     return sendJson(response, 200, { ok: true });
   }
 
@@ -1084,7 +961,7 @@ async function handleApi(request, response, url) {
     if (target.role === "admin" && body.role !== "admin") return sendError(response, 400, "The primary administrator role cannot be removed.");
     if (body.active === true || body.active === false) target.active = body.active;
     if (body.role === "student") target.role = "student";
-    saveStore();
+    await saveStore();
     return sendJson(response, 200, { user: safeUser(target) });
   }
 
@@ -1096,7 +973,7 @@ async function handleApi(request, response, url) {
     store.users = store.users.filter((candidate) => candidate.id !== target.id);
     store.activity = store.activity.filter((item) => item.userId !== target.id);
     store.books.forEach((book) => { book.favorites = (book.favorites || []).filter((id) => id !== target.id); });
-    saveStore();
+    await saveStore();
     return sendJson(response, 200, { ok: true });
   }
 
@@ -1133,7 +1010,14 @@ function serveStatic(request, response, url) {
   });
 }
 
-async function start() {
+async function initialize() {
+  if (!JWT_SECRET || JWT_SECRET.length < 32) {
+    throw new Error("Set JWT_SECRET to a random secret of at least 32 characters.");
+  }
+  Object.assign(startupStore, await readStore());
+  startupSnapshot = clone(startupStore);
+  initializeHierarchy();
+
   // Provision the first administrator from environment variables, never from committed source.
   const admin = store.users.find((user) => user.email === ADMIN_EMAIL);
   if (!store.developers.length) store.developers = DEFAULT_DEVELOPERS.map((developer, index) => normalizeDeveloper(developer, index));
@@ -1148,47 +1032,95 @@ async function start() {
       id: crypto.randomUUID(), name: "Library Administrator", email: ADMIN_EMAIL,
       salt, passwordHash, role: "admin", active: true, createdAt: new Date().toISOString()
     });
-    saveStore();
   } else if (admin.role !== "admin") {
     throw new Error(`The configured administrator email ${ADMIN_EMAIL} is already registered as a student.`);
   }
-  importBooksFromFolder();
-  initializeHierarchy();
-  saveStore();
+  await saveStore();
+}
 
-  const server = http.createServer(async (request, response) => {
-    try {
-      const url = new URL(request.url, `http://${request.headers.host || "localhost"}`);
-      if (url.pathname.startsWith("/api/")) {
-        if (!["GET", "POST", "PUT", "PATCH", "DELETE"].includes(request.method)) {
-          response.setHeader("Allow", "GET, POST, PUT, PATCH, DELETE");
-          return sendError(response, 405, "This request method is not supported.");
-        }
-        await handleApi(request, response, url);
-        return;
-      }
+const app = express();
+app.disable("x-powered-by");
+app.use(cors());
+app.use(express.json({ limit: MAX_JSON_BYTES }));
+
+const multipartLimits = new Map([
+  ["/api/admin/books", MAX_UPLOAD_BYTES],
+  ["/api/admin/videos", MAX_VIDEO_UPLOAD_BYTES],
+  ["/api/admin/about/photo", MAX_PROFILE_PHOTO_BYTES]
+]);
+const multipartUploaders = new Map([...multipartLimits].map(([route, fileSize]) => [
+  route,
+  multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize, files: 1, fields: 10, fieldSize: 64 * 1024 }
+  }).single("file")
+]));
+
+const ready = initialize();
+app.all("*", async (request, response, next) => {
+  try {
+    await ready;
+    const url = new URL(request.url, `http://${request.headers.host || "localhost"}`);
+    if (!url.pathname.startsWith("/api/")) {
       if (request.method !== "GET" && request.method !== "HEAD") {
         response.setHeader("Allow", "GET, HEAD");
         return sendError(response, 405, "This request method is not supported.");
       }
-      serveStatic(request, response, url);
-    } catch (error) {
-      if (response.headersSent) {
-        response.destroy(error);
-        return;
-      }
-      const status = Number.isInteger(error.status) ? error.status : 500;
-      if (status === 500) console.error("Request failed:", error);
-      sendError(response, status, status === 500 ? "The library could not complete this request." : error.message);
+      return serveStatic(request, response, url);
     }
-  });
+    if (!["GET", "POST", "PUT", "PATCH", "DELETE"].includes(request.method)) {
+      response.setHeader("Allow", "GET, POST, PUT, PATCH, DELETE");
+      return sendError(response, 405, "This request method is not supported.");
+    }
+    const state = await readStore();
+    const context = { state, before: clone(state) };
+    await storeContext.run(context, async () => {
+      const maximumBytes = multipartLimits.get(request.path);
+      if (request.method === "POST" && maximumBytes && request.is("multipart/form-data")) {
+        if (!requireAdmin(request, response)) return;
+        await new Promise((resolve, reject) => {
+          multipartUploaders.get(request.path)(request, response, (error) => error ? reject(error) : resolve());
+        });
+      }
+      await handleApi(request, response, url);
+    });
+  } catch (error) {
+    if (response.headersSent) {
+      response.destroy(error);
+      return;
+    }
+    const status = error instanceof multer.MulterError
+      ? error.code === "LIMIT_FILE_SIZE" ? 413 : 400
+      : Number.isInteger(error.status) ? error.status : 500;
+    if (status === 500) console.error("Request failed:", error);
+    const message = error instanceof multer.MulterError
+      ? status === 413 ? "Uploaded file exceeds the allowed size." : "Invalid multipart upload."
+      : status === 500 ? "The library could not complete this request." : error.message;
+    sendError(response, status, message);
+  }
+});
 
-  server.listen(PORT, "0.0.0.0", () => {
-    console.log(`Nasawa E-Library is listening on port ${PORT}.`);
+app.use((error, request, response, next) => {
+  if (response.headersSent) return next(error);
+  const status = error instanceof multer.MulterError
+    ? error.code === "LIMIT_FILE_SIZE" ? 413 : 400
+    : Number.isInteger(error.status) ? error.status : 500;
+  if (status === 500) console.error("Request failed:", error);
+  const message = error instanceof multer.MulterError
+    ? status === 413 ? "Uploaded file exceeds the allowed size." : "Invalid multipart upload."
+    : status === 500 ? "The library could not complete this request." : error.message;
+  sendError(response, status, message);
+});
+
+if (require.main === module) {
+  ready.then(() => {
+    app.listen(PORT, "0.0.0.0", () => {
+      console.log(`Nasawa E-Library is listening on port ${PORT}.`);
+    });
+  }).catch((error) => {
+    console.error(error.message);
+    process.exitCode = 1;
   });
 }
 
-start().catch((error) => {
-  console.error(error.message);
-  process.exitCode = 1;
-});
+module.exports = app;
