@@ -988,11 +988,12 @@ function serveStatic(request, response, url) {
     return sendError(response, 400, "Invalid URL.");
   }
   if (pathname === "/") pathname = "/INDEX.HTML";
+  pathname = pathname.replace(/\/{2,}/g, "/");
   const publicFiles = new Map([
-    ["/INDEX.HTML", path.join(ROOT, "INDEX.HTML")],
-    ["/STYLE.CSS", path.join(ROOT, "STYLE.CSS")],
-    ["/SCRIPT.JS", path.join(ROOT, "SCRIPT.JS")],
-    ["/BOOK-CATALOG.JS", path.join(ROOT, "BOOK-CATALOG.JS")],
+    ["/INDEX.HTML", path.join(ROOT, "index.html")],
+    ["/STYLE.CSS", path.join(ROOT, "style.css")],
+    ["/SCRIPT.JS", path.join(ROOT, "script.js")],
+    ["/BOOK-CATALOG.JS", path.join(ROOT, "book-catalog.js")],
     ["/PHOTOS/IMG-1.JPG", path.join(ROOT, "PHOTOS", "IMG-1.jpg")]
   ]);
   const filePath = publicFiles.get(pathname.toUpperCase());
@@ -1065,6 +1066,9 @@ app.all("*", async (request, response, next) => {
   try {
     await ready;
     const url = new URL(request.url, `http://${request.headers.host || "localhost"}`);
+    // Vercel rewrites every non-file request to /api/index, which can surface here as the
+    // function's own path instead of the page the visitor asked for. Treat it as the site root.
+    if (/^\/api\/index(?:\.js)?\/?$/i.test(url.pathname)) url.pathname = "/";
     if (!url.pathname.startsWith("/api/")) {
       if (request.method !== "GET" && request.method !== "HEAD") {
         response.setHeader("Allow", "GET, HEAD");
