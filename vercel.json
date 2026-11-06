@@ -1,18 +1,15 @@
 {
+  "$schema": "https://openapi.vercel.sh/vercel.json",
   "version": 2,
-  "builds": [
-    {
-      "src": "api/index.js",
-      "use": "@vercel/node",
-      "config": {
-        "includeFiles": "{INDEX.HTML,STYLE.CSS,SCRIPT.JS,BOOK-CATALOG.JS,PHOTOS/**}"
-      }
+  "functions": {
+    "api/index.js": {
+      "includeFiles": "{INDEX.HTML,STYLE.CSS,SCRIPT.JS,BOOK-CATALOG.JS,PHOTOS/**}"
     }
-  ],
-  "routes": [
+  },
+  "rewrites": [
     {
-      "src": "/(.*)",
-      "dest": "api/index.js"
+      "source": "/(.*)",
+      "destination": "/api/index"
     }
   ]
 }

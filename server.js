@@ -12,7 +12,7 @@ const express = require("express");
 const cors = require("cors");
 const jwt = require("jsonwebtoken");
 const multer = require("multer");
-const supabase = require("./supabaseClient");
+const getSupabaseClient = require("./supabaseClient");
 
 const scrypt = promisify(crypto.scrypt);
 const ROOT = __dirname;
@@ -137,7 +137,7 @@ async function readStore() {
   const data = [];
   const pageSize = 1000;
   for (let offset = 0; ; offset += pageSize) {
-    const { data: page, error } = await supabase.from("library_records")
+    const { data: page, error } = await getSupabaseClient().from("library_records")
       .select("collection,id,data")
       .order("collection", { ascending: true })
       .order("id", { ascending: true })
@@ -187,13 +187,13 @@ async function persistStoreChanges(previous, current) {
     }
   }
   for (let offset = 0; offset < upserts.length; offset += 500) {
-    const { error } = await supabase.from("library_records")
+    const { error } = await getSupabaseClient().from("library_records")
       .upsert(upserts.slice(offset, offset + 500), { onConflict: "collection,id" });
     if (error) throw new Error(`Could not save library data to Supabase: ${error.message}`);
   }
   for (const [collection, ids] of removals) {
     for (let offset = 0; offset < ids.length; offset += 200) {
-      const { error } = await supabase.from("library_records")
+      const { error } = await getSupabaseClient().from("library_records")
         .delete().eq("collection", collection).in("id", ids.slice(offset, offset + 200));
       if (error) throw new Error(`Could not remove library data from Supabase: ${error.message}`);
     }
@@ -461,7 +461,7 @@ function publicVideo(video) {
 
 async function uploadToSupabase(data, bucket, extension = "", contentType = "application/octet-stream") {
   const assetPath = `${crypto.randomUUID()}${extension}`;
-  const { error } = await supabase.storage.from(bucket).upload(assetPath, data, {
+  const { error } = await getSupabaseClient().storage.from(bucket).upload(assetPath, data, {
     contentType,
     upsert: false
   });
@@ -472,7 +472,7 @@ async function uploadToSupabase(data, bucket, extension = "", contentType = "app
 async function deleteStoredAsset(resource) {
   const asset = resource.storageAsset || resource.photoAsset;
   if (!asset?.bucket || !asset.path) return;
-  const { error } = await supabase.storage.from(asset.bucket).remove([asset.path]);
+  const { error } = await getSupabaseClient().storage.from(asset.bucket).remove([asset.path]);
   if (error) throw new Error(`Could not delete file from Supabase Storage: ${error.message}`);
 }
 
@@ -480,7 +480,7 @@ async function serveSupabaseAsset(request, response, asset, fileName, dispositio
   if (!asset?.bucket || !asset.path) {
     throw new Error("The stored Supabase Storage reference is invalid.");
   }
-  const { data, error } = await supabase.storage.from(asset.bucket).createSignedUrl(asset.path, 60);
+  const { data, error } = await getSupabaseClient().storage.from(asset.bucket).createSignedUrl(asset.path, 60);
   if (error || !data?.signedUrl) {
     throw new Error(`Could not create a Supabase download link: ${error?.message || "No signed URL was returned."}`);
   }
@@ -1056,7 +1056,11 @@ const multipartUploaders = new Map([...multipartLimits].map(([route, fileSize]) 
   }).single("file")
 ]));
 
-const ready = initialize();
+const ready = initialize().catch((error) => {
+  console.error("Library initialization failed:", error);
+  throw Object.assign(new Error("The library service is not configured or available."), { status: 503 });
+});
+ready.catch(() => {});
 app.all("*", async (request, response, next) => {
   try {
     await ready;
